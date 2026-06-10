@@ -1,0 +1,35 @@
+{
+  "expo": {
+    "name": "Indian Rail Trip Planner",
+    "slug": "indianrail-trip-planner",
+    "scheme": "indianrailtrip",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.local.indianrailtripplanner",
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "fetch"
+        ]
+      }
+    },
+    "android": {
+      "package": "com.local.indianrailtripplanner",
+      "permissions": [
+        "RECEIVE_BOOT_COMPLETED",
+        "WAKE_LOCK",
+        "SCHEDULE_EXACT_ALARM",
+        "POST_NOTIFICATIONS"
+      ]
+    },
+    "plugins": [
+      "expo-sqlite",
+      "expo-notifications",
+      "expo-background-fetch",
+      "expo-task-manager",
+      "expo-font"
+    ]
+  }
+}
