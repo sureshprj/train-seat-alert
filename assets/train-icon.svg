@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" rx="220" fill="#1d3557"/>
+  <circle cx="252" cy="224" r="46" fill="#f2a541"/>
+  <circle cx="772" cy="224" r="46" fill="#f2a541"/>
+  <path fill="#ffffff" d="M290 184h444c72 0 130 58 130 130v352c0 57-37 105-88 123l62 84h-98l-44-60H328l-44 60h-98l62-84c-51-18-88-66-88-123V314c0-72 58-130 130-130Z"/>
+  <path fill="#1d3557" d="M274 318c0-24 20-44 44-44h388c24 0 44 20 44 44v146H274V318Z"/>
+  <rect x="300" y="522" width="424" height="64" rx="32" fill="#e8edf3"/>
+  <circle cx="336" cy="684" r="54" fill="#1d3557"/>
+  <circle cx="688" cy="684" r="54" fill="#1d3557"/>
+  <circle cx="336" cy="684" r="22" fill="#ffffff"/>
+  <circle cx="688" cy="684" r="22" fill="#ffffff"/>
+  <path fill="#f2a541" d="M394 658h236c16 0 30 14 30 30s-14 30-30 30H394c-16 0-30-14-30-30s14-30 30-30Z"/>
+  <path fill="#ffffff" opacity="0.28" d="M318 274h388c24 0 44 20 44 44v18H274v-18c0-24 20-44 44-44Z"/>
+</svg>

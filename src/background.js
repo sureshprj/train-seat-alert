@@ -11,7 +11,7 @@ TaskManager.defineTask(BACKGROUND_CHECK_TASK, async () => {
     await initDatabase();
     await configureNotifications();
     const result = await runDueScheduledChecks();
-    return result.checked > 0 || result.captchaRequired
+    return result.checked > 0 || result.reminded > 0 || result.captchaRequired
       ? BackgroundFetch.BackgroundFetchResult.NewData
       : BackgroundFetch.BackgroundFetchResult.NoData;
   } catch {

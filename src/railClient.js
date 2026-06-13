@@ -71,12 +71,14 @@ async function persistSetCookies(setCookieHeader) {
 
 async function railRequest(config) {
   const cookieHeader = await getCookieHeader();
+  const useStoredCookies = config.useStoredCookies !== false;
   const response = await axios({
     timeout: 20000,
+    withCredentials: true,
     ...config,
     headers: {
       ...browserHeaders,
-      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+      ...(useStoredCookies && cookieHeader ? { Cookie: cookieHeader } : {}),
       ...(config.headers || {})
     }
   });
@@ -86,9 +88,10 @@ async function railRequest(config) {
 }
 
 export async function getSessionStatus() {
+  const lastUsed = await getSetting('rail_session_last_used', '');
   return {
     isActive: (await getSetting('rail_session_active', '0')) === '1',
-    lastUsed: await getSetting('rail_session_last_used', '')
+    lastUsed
   };
 }
 
@@ -111,7 +114,7 @@ export async function fetchCaptchaImage() {
   return `data:image/png;base64,${base64FromArrayBuffer(response.data)}`;
 }
 
-async function fetchReferenceValues(type) {
+async function fetchReferenceValues(type, options = {}) {
   const cacheKey = `rail_reference_${type}`;
   const stored = await getSetting(cacheKey, '');
   if (stored) {
@@ -125,6 +128,8 @@ async function fetchReferenceValues(type) {
     }
   }
 
+  if (options.cacheOnly) return [];
+
   const endpoint = type === 'trains' ? 'FetchTrainData' : 'FetchAutoComplete';
   const response = await railRequest({
     method: 'GET',
@@ -137,6 +142,73 @@ async function fetchReferenceValues(type) {
   const values = Array.isArray(response.data) ? response.data : [];
   await setSetting(cacheKey, JSON.stringify({ values, loadedAt: Date.now() }));
   return values;
+}
+
+function normalizeSearchText(value) {
+  return String(value || '').toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();
+}
+
+function compactSearchText(value) {
+  return normalizeSearchText(value).replace(/\s+/g, '');
+}
+
+function searchReferenceValues(values, query, parseValue, limit = 8) {
+  const normalizedQuery = normalizeSearchText(query);
+  const compactQuery = compactSearchText(query);
+  if (normalizedQuery.length < 2 && compactQuery.length < 2) return [];
+
+  const scored = [];
+  for (const rawValue of values) {
+    const label = String(rawValue || '').trim();
+    if (!label) continue;
+
+    const value = parseValue(label);
+    const normalizedLabel = normalizeSearchText(label);
+    const compactLabel = compactSearchText(label);
+    const normalizedValue = normalizeSearchText(value);
+    const compactValue = compactSearchText(value);
+
+    let score = 0;
+    if (compactValue === compactQuery) score = 100;
+    else if (compactValue.startsWith(compactQuery)) score = 90;
+    else if (normalizedLabel.startsWith(normalizedQuery)) score = 80;
+    else if (normalizedLabel.includes(normalizedQuery)) score = 60;
+    else if (compactLabel.includes(compactQuery)) score = 50;
+    if (!score) continue;
+
+    scored.push({ label, value, score });
+  }
+
+  return scored
+    .sort((a, b) => b.score - a.score || a.label.localeCompare(b.label))
+    .slice(0, limit)
+    .map(({ label, value }) => ({ label, value }));
+}
+
+function trainNumberFromSelector(selector) {
+  const match = String(selector || '').match(/\b\d{4,6}\b/);
+  return match ? match[0] : String(selector || '').trim();
+}
+
+function stationCodeFromSelector(selector) {
+  const text = String(selector || '').trim().toUpperCase();
+  const trailingCode = text.match(/-\s*([A-Z0-9]{2,6})\s*$/);
+  if (trailingCode) return trailingCode[1];
+
+  const leadingCode = text.match(/^([A-Z0-9]{2,6})\s*-/);
+  if (leadingCode) return leadingCode[1];
+
+  return text;
+}
+
+export async function searchTrainSuggestions(query, limit = 8) {
+  const trains = await fetchReferenceValues('trains');
+  return searchReferenceValues(trains, query, trainNumberFromSelector, limit);
+}
+
+export async function searchStationSuggestions(query, limit = 8) {
+  const stations = await fetchReferenceValues('stations');
+  return searchReferenceValues(stations, query, stationCodeFromSelector, limit);
 }
 
 function resolveTrainSelector(input, trains) {

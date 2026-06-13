@@ -1,14 +1,15 @@
 {
   "expo": {
-    "name": "Indian Rail Trip Planner",
-    "slug": "indianrail-trip-planner",
-    "scheme": "indianrailtrip",
+    "name": "Train Seat Alert",
+    "slug": "train-seat-alert",
+    "scheme": "trainseatalert",
     "version": "1.0.0",
+    "icon": "./assets/icon.png",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "com.local.indianrailtripplanner",
+      "bundleIdentifier": "com.local.trainseatalert",
       "infoPlist": {
         "UIBackgroundModes": [
           "fetch"
@@ -16,12 +17,18 @@
       }
     },
     "android": {
-      "package": "com.local.indianrailtripplanner",
+      "package": "com.local.trainseatalert",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#1d3557"
+      },
       "permissions": [
         "RECEIVE_BOOT_COMPLETED",
         "WAKE_LOCK",
         "SCHEDULE_EXACT_ALARM",
-        "POST_NOTIFICATIONS"
+        "POST_NOTIFICATIONS",
+        "android.permission.RECEIVE_BOOT_COMPLETED",
+        "android.permission.WAKE_LOCK"
       ]
     },
     "plugins": [
@@ -30,6 +37,11 @@
       "expo-background-fetch",
       "expo-task-manager",
       "expo-font"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "f5061829-8269-42d3-8373-ae4d4f63ae72"
+      }
+    }
   }
 }

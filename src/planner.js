@@ -1,16 +1,28 @@
 import dayjs from 'dayjs';
 import {
+  ensureFutureOccurrences,
   getActiveEvents,
+  getBookingWindowReminderCandidates,
   getEvent,
+  getSetting,
   getPendingOccurrencesForEvent,
-  getRunCount,
+  hasBookingWindowReminderRun,
   hasRun,
+  markOccurrenceAlerted,
   recordAvailability,
-  recordRun
+  recordBookingWindowReminderRun,
+  recordRuns,
+  setSetting
 } from './database';
-import { createAvailabilityNotification, createCaptchaNotification } from './notifications';
+import {
+  createAvailabilityNotification,
+  createBookingWindowReminderNotification,
+  createCaptchaNotification
+} from './notifications';
 import { requestAvailability } from './railClient';
 import {
+  ADVANCE_DAYS,
+  BOOKING_WINDOW_REMINDER_DAYS,
   currentLocalTime,
   formatAvailabilitySummary,
   formatShortDate,
@@ -27,6 +39,99 @@ function buildLowAvailabilityMessage(row, parsed) {
   return `${formatShortDate(row.travel_date)} status is ${parsed.availability_status}. Please review the ticket.`;
 }
 
+function alertSignature(parsed) {
+  return [
+    String(parsed.availability_status || '').trim().toUpperCase(),
+    parsed.available_count ?? ''
+  ].join('|');
+}
+
+function normalizeAvailabilityDate(value) {
+  const text = String(value || '').trim();
+  let match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (match) return `${match[1]}-${match[2]}-${match[3]}`;
+
+  match = /^(\d{2})-(\d{2})-(\d{4})$/.exec(text);
+  if (match) return `${match[3]}-${match[2]}-${match[1]}`;
+
+  return text;
+}
+
+function parseRawPayload(raw) {
+  if (typeof raw !== 'string') return raw;
+  try {
+    return JSON.parse(raw.trim());
+  } catch {
+    return null;
+  }
+}
+
+function findAvailabilityDays(value) {
+  if (!value || typeof value !== 'object') return [];
+  if (Array.isArray(value)) {
+    if (value.some((item) => item && typeof item === 'object' && (item.availablityDate || item.availabilityDate))) return value;
+    return value.flatMap(findAvailabilityDays);
+  }
+  if (Array.isArray(value.avlDayList)) return value.avlDayList;
+  return Object.values(value).flatMap(findAvailabilityDays);
+}
+
+function availabilityDatesFromRaw(raw) {
+  return new Set(
+    findAvailabilityDays(parseRawPayload(raw))
+      .map((day) => normalizeAvailabilityDate(day?.availablityDate || day?.availabilityDate || day?.date))
+      .filter(Boolean)
+  );
+}
+
+async function notifyIfNeeded(row, parsed, checkedAt, options = {}) {
+  const belowThreshold = row.user_status === 'pending' && isBelowThresholdStatus(parsed, row.threshold);
+  if (!options.suppressNotifications && belowThreshold) {
+    const signature = alertSignature(parsed);
+    if (signature !== row.last_alert_signature) {
+      await createAvailabilityNotification(
+        row.event_id,
+        row.id,
+        buildLowAvailabilityMessage(row, parsed),
+        options.nativeNotification !== false
+      );
+      await markOccurrenceAlerted(row.id, signature, checkedAt);
+    }
+  } else if (!belowThreshold && row.last_alert_signature) {
+    await markOccurrenceAlerted(row.id, null, null);
+  }
+}
+
+function checkTimeValue(time) {
+  const match = /^(\d{2}):(\d{2})$/.exec(String(time || '').trim());
+  if (!match) return null;
+  return (Number(match[1]) * 60) + Number(match[2]);
+}
+
+function dueScheduledTimes(checkTimes, localTime) {
+  const currentValue = checkTimeValue(localTime);
+  if (currentValue === null) return [];
+
+  return checkTimes
+    .map((time) => time.trim())
+    .filter(Boolean)
+    .filter((time) => {
+      const value = checkTimeValue(time);
+      return value !== null && value <= currentValue;
+    });
+}
+
+async function createCaptchaNotificationOncePerDay(event, runDate, options = {}) {
+  if (options.suppressCaptchaNotifications) return;
+
+  const key = `captcha_notification_date_${event.id}`;
+  const lastNotificationDate = await getSetting(key, '');
+  if (lastNotificationDate === runDate) return;
+
+  await createCaptchaNotification(event.id, event.name, true);
+  await setSetting(key, runDate);
+}
+
 export async function checkOccurrence(row, options = {}) {
   if (!row) return { notFound: true };
   if (row.user_status !== 'pending' && !options.force) {
@@ -39,15 +144,7 @@ export async function checkOccurrence(row, options = {}) {
   const parsed = parseAvailability(response.raw, row.travel_date);
   const checkedAt = nowIso();
   await recordAvailability(row, parsed, response.raw, checkedAt);
-
-  if (!options.suppressNotifications && row.user_status === 'pending' && isBelowThresholdStatus(parsed, row.threshold)) {
-    await createAvailabilityNotification(
-      row.event_id,
-      row.id,
-      buildLowAvailabilityMessage(row, parsed),
-      options.nativeNotification !== false
-    );
-  }
+  await notifyIfNeeded(row, parsed, checkedAt, options);
 
   return {
     occurrenceId: row.id,
@@ -60,51 +157,129 @@ export async function checkOccurrence(row, options = {}) {
   };
 }
 
+async function recordOccurrenceFromRaw(row, raw, options = {}) {
+  const parsed = parseAvailability(raw, row.travel_date);
+  const checkedAt = nowIso();
+  await recordAvailability(row, parsed, raw, checkedAt);
+  await notifyIfNeeded(row, parsed, checkedAt, options);
+  return {
+    occurrenceId: row.id,
+    travelDate: row.travel_date,
+    availableCount: parsed.available_count,
+    availabilityStatus: parsed.availability_status,
+    availabilitySummary: formatAvailabilitySummary({ ...parsed, last_checked_at: checkedAt }),
+    checkedAt,
+    raw
+  };
+}
+
 export async function checkEvent(eventId, options = {}) {
   const event = await getEvent(eventId);
   if (!event) return { notFound: true };
 
-  const rows = await getPendingOccurrencesForEvent(eventId);
+  const rows = await getPendingOccurrencesForEvent(eventId, {
+    includeAllStatuses: Boolean(options.includeAllStatuses)
+  });
   const results = [];
+  const handledIds = new Set();
   for (let index = 0; index < rows.length; index += 1) {
+    if (handledIds.has(rows[index].id)) continue;
+
     const result = await checkOccurrence(rows[index], {
       ...options,
+      force: options.force || options.includeAllStatuses,
       inputCaptcha: index === 0 ? options.inputCaptcha : ''
     });
 
     if (result.captchaRequired) {
       return { captchaRequired: true, detail: result.detail, results };
     }
-    if (!result.skipped) results.push(result);
+    if (result.skipped) continue;
+
+    results.push(result);
+    handledIds.add(rows[index].id);
+
+    const responseDates = availabilityDatesFromRaw(result.raw);
+    if (!responseDates.size) continue;
+
+    for (let followIndex = index + 1; followIndex < rows.length; followIndex += 1) {
+      const row = rows[followIndex];
+      if (handledIds.has(row.id) || !responseDates.has(row.travel_date)) continue;
+      results.push(await recordOccurrenceFromRaw(row, result.raw, options));
+      handledIds.add(row.id);
+    }
+
+    if (!options.deepCheck) break;
   }
 
   return { eventId: Number(eventId), checked: results.length, results };
 }
 
 export async function runDueScheduledChecks() {
+  return runDueScheduledChecksWithOptions();
+}
+
+export async function runBookingWindowReminders(options = {}) {
+  await ensureFutureOccurrences(false);
+  const today = dayjs().startOf('day');
+  const candidates = await getBookingWindowReminderCandidates();
+  let reminded = 0;
+
+  for (const row of candidates) {
+    const bookingOpenDate = dayjs(row.travel_date).subtract(ADVANCE_DAYS, 'day').startOf('day');
+    const daysBefore = bookingOpenDate.diff(today, 'day');
+    if (!BOOKING_WINDOW_REMINDER_DAYS.includes(daysBefore)) continue;
+    if (await hasBookingWindowReminderRun(row.event_id, row.travel_date, daysBefore)) continue;
+
+    await createBookingWindowReminderNotification(
+      row.event_id,
+      row.occurrence_id,
+      row.event_name,
+      daysBefore,
+      options.nativeNotification !== false
+    );
+    await recordBookingWindowReminderRun(row.event_id, row.travel_date, daysBefore);
+    reminded += 1;
+  }
+
+  return { reminded };
+}
+
+export async function runDueScheduledChecksWithOptions(options = {}) {
   const localTime = currentLocalTime();
   const runDate = dayjs().format('YYYY-MM-DD');
+  const reminderResult = await runBookingWindowReminders(options);
+  await ensureFutureOccurrences(true);
   const events = await getActiveEvents();
   let checked = 0;
   let captchaRequired = false;
 
   for (const event of events) {
     const checkTimes = String(event.check_times || '08:00,13:00,20:00').split(',').map((item) => item.trim());
-    if (!checkTimes.includes(localTime)) continue;
+    const dueTimes = dueScheduledTimes(checkTimes, localTime);
+    if (!dueTimes.length) continue;
 
-    const runCount = await getRunCount(event.id, runDate);
-    if (runCount >= Number(event.max_triggers_per_day || checkTimes.length)) continue;
-    if (await hasRun(event.id, runDate, localTime)) continue;
+    const unrunDueTimes = [];
+    for (const time of dueTimes) {
+      if (!(await hasRun(event.id, runDate, time))) unrunDueTimes.push(time);
+    }
+    if (!unrunDueTimes.length) continue;
 
-    await recordRun(event.id, runDate, localTime);
     const result = await checkEvent(event.id, { automated: true });
     if (result.captchaRequired) {
       captchaRequired = true;
-      await createCaptchaNotification(event.id, event.name, true);
+      await createCaptchaNotificationOncePerDay(event, runDate, options);
+      return {
+        checked,
+        captchaRequired,
+        captchaEventId: event.id,
+        captchaEventName: event.name
+      };
     } else {
+      await recordRuns(event.id, runDate, unrunDueTimes);
       checked += result.checked || 0;
     }
   }
 
-  return { checked, captchaRequired };
+  return { checked, captchaRequired, reminded: reminderResult.reminded };
 }

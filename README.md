@@ -1,6 +1,6 @@
-# Indian Rail Trip Planner Mobile
+# Train Seat Alert Mobile
 
-Standalone React Native + Expo mobile version of the Trip Event Planner.
+Standalone React Native + Expo mobile app for train seat alerts and booking-window reminders.
 
 The app stores all data locally on the phone with `expo-sqlite`. It calls Indian Rail directly from the device, persists session cookies locally, asks for captcha only when the rail session is inactive, runs scheduled background checks through Expo background fetch, and raises native notifications for low availability, RAC, WL/RLWL, and captcha-required automation pauses.
 
@@ -25,14 +25,14 @@ Your phone and computer must be on the same Wi-Fi network. The mobile app does n
 
 ## Current Feature Set
 
-- Create, edit, delete, and select trip events
-- Train number input, class, quota, source station, destination station, threshold, active status
-- User-selectable check times and max triggers per day
+- Create, edit, delete, and select trips
+- Train number input, class, quota, source station, destination station, seat alert limit, active status
+- User-selectable check times
 - 60-day occurrence generation for the selected weekday
-- Check one occurrence or all pending occurrences for an event
+- Check one travel date or all pending travel dates for a trip
 - Captcha modal only when the direct rail session is inactive or rejected
 - Display availability, last checked time, pending/booked/ignored state
-- Highlight below-threshold confirmed seats, RAC, WL, and RLWL
+- Highlight seat alert limit matches, RAC, WL, and RLWL
 - Mark booked or ignored; ignored occurrences clear their notifications
 - Local notifications list with mark-read and clear-all
 - Background fetch registration for scheduled checks

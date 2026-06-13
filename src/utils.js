@@ -1,8 +1,55 @@
 import dayjs from 'dayjs';
 
 export const ADVANCE_DAYS = 60;
+export const BOOKING_WINDOW_REMINDER_DAYS = [2, 1];
+export const OCCURRENCE_GENERATION_DAYS = ADVANCE_DAYS + Math.max(...BOOKING_WINDOW_REMINDER_DAYS);
 export const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 export const DEFAULT_CHECK_TIMES = '08:00,13:00,20:00';
+export const RECURRENCE_OPTIONS = [
+  { value: 'daily', label: 'Daily' },
+  { value: 'weekly', label: 'Weekly' },
+  { value: 'fortnightly', label: '15 days' },
+  { value: 'monthly', label: 'Monthly' }
+];
+export const CLASS_OPTIONS = [
+  { value: '1A', label: 'FIRST AC' },
+  { value: 'EC', label: 'EXECUTIVE CLASS' },
+  { value: 'EA', label: 'EXECUTIVE ANUBHUTI' },
+  { value: '2A', label: 'SECOND AC' },
+  { value: '3A', label: 'THIRD AC' },
+  { value: '3E', label: '3 AC Economy' },
+  { value: 'CC', label: 'AC CHAIR CAR' },
+  { value: 'FC', label: 'FIRST CLASS' },
+  { value: 'SL', label: 'SLEEPER CLASS' },
+  { value: '2S', label: 'SECOND SEATING' },
+  { value: 'VS', label: 'VISTADOME NON AC' },
+  { value: 'HS', label: 'HIGH CAPACITY SLEEPER' },
+  { value: 'HC', label: 'HIGH CAPACITY VISTADOME_CC' },
+  { value: 'EV', label: 'VISTADOME AC' }
+];
+export const QUOTA_OPTIONS = [
+  { value: 'GN', label: 'General Quota' },
+  { value: 'TQ', label: 'Tatkal Quota' },
+  { value: 'PT', label: 'Premium Tatkal Quota' },
+  { value: 'LD', label: 'Ladies Quota' },
+  { value: 'DF', label: 'Defence Quota' },
+  { value: 'FT', label: 'Foreign Tourist Quota' },
+  { value: 'SS', label: 'Lower Berth Quota' },
+  { value: 'YU', label: 'Yuva Quota' },
+  { value: 'DP', label: 'Duty Pass Quota' },
+  { value: 'HP', label: 'Handicaped Quota' },
+  { value: 'PH', label: 'Parliament House' }
+];
+
+const EVENT_FIELD_LABELS = {
+  name: 'Trip name',
+  weekday: 'Travel weekday',
+  train_no: 'Train',
+  class_code: 'Class',
+  quota: 'Quota',
+  source_station: 'From station',
+  destination_station: 'To station'
+};
 
 export function nowIso() {
   return new Date().toISOString();
@@ -39,8 +86,35 @@ export function normalizeWeekday(value) {
   return match || '';
 }
 
+export function normalizeRecurrenceType(value) {
+  const normalized = String(value || 'weekly').trim().toLowerCase();
+  const aliases = {
+    '15days': 'fortnightly',
+    '15-days': 'fortnightly',
+    fifteen: 'fortnightly',
+    fortnight: 'fortnightly',
+    fortnightly: 'fortnightly'
+  };
+  const recurrenceType = aliases[normalized] || normalized;
+  return RECURRENCE_OPTIONS.some((option) => option.value === recurrenceType)
+    ? recurrenceType
+    : 'weekly';
+}
+
+export function normalizeIsoDate(value, fallback = toIsoDate(new Date())) {
+  const text = String(value || '').trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (!match) return fallback;
+
+  const parsed = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  const isValid = parsed.getFullYear() === Number(match[1])
+    && parsed.getMonth() === Number(match[2]) - 1
+    && parsed.getDate() === Number(match[3]);
+  return isValid ? text : fallback;
+}
+
 export function normalizeCheckTimes(value) {
-  const rawValues = Array.isArray(value) ? value : String(value || DEFAULT_CHECK_TIMES).split(',');
+  const rawValues = Array.isArray(value) ? value : String(value || '').split(',');
   const times = [...new Set(rawValues
     .map((item) => String(item).trim())
     .filter(Boolean)
@@ -55,21 +129,69 @@ export function normalizeCheckTimes(value) {
     .filter(Boolean))]
     .sort();
 
-  return times.length ? times.join(',') : DEFAULT_CHECK_TIMES;
+  return times.join(',');
+}
+
+export function invalidCheckTimes(value) {
+  const rawValues = Array.isArray(value) ? value : String(value || '').split(',');
+  return rawValues
+    .map((item) => String(item).trim())
+    .filter(Boolean)
+    .filter((item) => {
+      const match = /^(\d{1,2}):(\d{2})$/.exec(item);
+      if (!match) return true;
+      const hour = Number(match[1]);
+      const minute = Number(match[2]);
+      return hour > 23 || minute > 59;
+    });
 }
 
 export function currentLocalTime() {
   return dayjs().format('HH:mm');
 }
 
-export function generateTravelDates(weekday, days = ADVANCE_DAYS) {
-  const normalized = normalizeWeekday(weekday);
+export function generateTravelDates(schedule, days = ADVANCE_DAYS) {
+  if (typeof schedule === 'string') {
+    schedule = { weekday: schedule, recurrence_type: 'weekly' };
+  }
+
+  const recurrenceType = normalizeRecurrenceType(schedule?.recurrence_type ?? schedule?.recurrenceType);
+  const startDate = normalizeIsoDate(schedule?.start_date ?? schedule?.startDate);
+  const today = dayjs().startOf('day');
+  const end = today.add(days, 'day');
+  const dates = [];
+
+  if (recurrenceType === 'daily') {
+    let cursor = dayjs(startDate).startOf('day');
+    if (cursor.isBefore(today)) cursor = today;
+    while (cursor.isBefore(end) || cursor.isSame(end, 'day')) {
+      dates.push(cursor.format('YYYY-MM-DD'));
+      cursor = cursor.add(1, 'day');
+    }
+    return dates;
+  }
+
+  if (recurrenceType === 'fortnightly' || recurrenceType === 'monthly') {
+    let cursor = dayjs(startDate).startOf('day');
+    while (cursor.isBefore(today)) {
+      cursor = recurrenceType === 'fortnightly'
+        ? cursor.add(15, 'day')
+        : cursor.add(1, 'month');
+    }
+    while (cursor.isBefore(end) || cursor.isSame(end, 'day')) {
+      dates.push(cursor.format('YYYY-MM-DD'));
+      cursor = recurrenceType === 'fortnightly'
+        ? cursor.add(15, 'day')
+        : cursor.add(1, 'month');
+    }
+    return dates;
+  }
+
+  const normalized = normalizeWeekday(schedule?.weekday);
   const targetDay = WEEKDAYS.indexOf(normalized);
   if (targetDay === -1) return [];
 
-  const dates = [];
-  let cursor = dayjs().startOf('day');
-  const end = cursor.add(days, 'day');
+  let cursor = today;
 
   while (cursor.isBefore(end) || cursor.isSame(end, 'day')) {
     if (cursor.day() === targetDay) dates.push(cursor.format('YYYY-MM-DD'));
@@ -80,8 +202,17 @@ export function generateTravelDates(weekday, days = ADVANCE_DAYS) {
 }
 
 export function parseAvailableCount(statusText) {
+  if (isNotAvailableStatus(statusText)) return null;
   const availableMatch = String(statusText || '').match(/AVAILABLE\s*[-:]?\s*0*(\d+)/i);
   return availableMatch ? Number(availableMatch[1]) : null;
+}
+
+export function isNotAvailableStatus(statusText) {
+  return /NOT\s+AVAILABLE|REGRET|NOT\s+RUNNING|TRAIN\s+CANCELLED/i.test(String(statusText || ''));
+}
+
+export function isAvailableStatus(statusText) {
+  return !isNotAvailableStatus(statusText) && /\bAVAILABLE\s*[-:]?\s*\d+/i.test(String(statusText || ''));
 }
 
 function normalizeAvailabilityDate(value) {
@@ -198,6 +329,7 @@ export function hasRacStatus(statusText) {
 }
 
 export function isBelowThresholdStatus(occurrenceOrParsed, threshold) {
+  if (isNotAvailableStatus(occurrenceOrParsed.availability_status)) return false;
   if (occurrenceOrParsed.available_count !== null && occurrenceOrParsed.available_count !== undefined) {
     return Number(occurrenceOrParsed.available_count) <= Number(threshold);
   }
@@ -211,7 +343,13 @@ export function formatAvailabilitySummary(occurrence) {
   const parsedCount = parseAvailableCount(status);
 
   if (!status && !occurrence.last_checked_at) return 'Not checked';
-  if (/AVAILABLE/i.test(status) && (hasCount || parsedCount !== null)) {
+  if (isNotAvailableStatus(status)) {
+    if (/REGRET/i.test(status)) return 'Regret';
+    if (/NOT\s+RUNNING/i.test(status)) return 'Not running';
+    if (/TRAIN\s+CANCELLED/i.test(status)) return 'Train cancelled';
+    return 'Not available';
+  }
+  if (isAvailableStatus(status) && (hasCount || parsedCount !== null)) {
     const count = hasCount ? occurrence.available_count : parsedCount;
     return `${count} confirmed ticket${count === 1 ? '' : 's'}`;
   }
@@ -219,42 +357,96 @@ export function formatAvailabilitySummary(occurrence) {
   const racMatch = status.match(/RAC\s*0*(\d+)/i);
   if (racMatch) return `RAC ${Number(racMatch[1])}`;
   if (hasWaitlistStatus(status)) return `Waitlist: ${status.replace(/\//g, ' / ')}`;
-  if (/REGRET/i.test(status)) return 'Regret';
-  if (/NOT AVAILABLE/i.test(status)) return 'Not available';
   return status || 'Checked';
 }
 
+function trainNumberFromInput(value) {
+  const match = String(value || '').match(/\b\d{4,6}\b/);
+  return match ? match[0] : String(value || '').trim();
+}
+
+function stationCodeFromInput(value) {
+  const text = String(value || '').trim().toUpperCase();
+  const trailingCode = text.match(/-\s*([A-Z0-9]{2,6})\s*$/);
+  if (trailingCode) return trailingCode[1];
+
+  const leadingCode = text.match(/^([A-Z0-9]{2,6})\s*-/);
+  if (leadingCode) return leadingCode[1];
+
+  return text;
+}
+
+function compactOptionText(value) {
+  return String(value || '').toUpperCase().replace(/[^A-Z0-9]+/g, '');
+}
+
+function optionCodeFromInput(value, options) {
+  const text = String(value || '').trim();
+  const upperText = text.toUpperCase();
+  const explicitCode = upperText.match(/^([A-Z0-9]{1,6})\s*-/);
+  if (explicitCode && options.some((option) => option.value === explicitCode[1])) return explicitCode[1];
+
+  const direct = options.find((option) => option.value === upperText);
+  if (direct) return direct.value;
+
+  const compactText = compactOptionText(text);
+  const labelMatch = options.find((option) => compactOptionText(option.label) === compactText);
+  return labelMatch ? labelMatch.value : upperText;
+}
+
 export function normalizeEventPayload(body) {
-  const threshold = Number(body.threshold ?? 20);
-  const checkTimes = normalizeCheckTimes(body.check_times ?? body.checkTimes);
-  const maxTriggers = Number(body.max_triggers_per_day ?? body.maxTriggersPerDay ?? checkTimes.split(',').length);
+  const thresholdInput = body.threshold;
+  const threshold = String(thresholdInput).trim() === '' ? Number.NaN : Number(thresholdInput);
+  const checkTimesInput = body.check_times ?? body.checkTimes ?? '';
+  const checkTimes = normalizeCheckTimes(checkTimesInput);
+  const recurrenceType = normalizeRecurrenceType(body.recurrence_type ?? body.recurrenceType);
+  const startDateInput = body.start_date ?? body.startDate ?? toIsoDate(new Date());
+  const startDate = normalizeIsoDate(startDateInput, '');
+  const isActive = body.is_active === undefined && body.isActive === undefined
+    ? 1
+    : Number(Boolean(body.is_active ?? body.isActive));
 
   return {
     name: String(body.name || '').trim(),
     weekday: normalizeWeekday(body.weekday),
-    train_no: String(body.train_no ?? body.trainNo ?? '').trim(),
+    recurrence_type: recurrenceType,
+    start_date: startDate,
+    train_no: trainNumberFromInput(body.train_no ?? body.trainNo),
     train_name: '',
-    class_code: String(body.class_code ?? body.classCode ?? body.classc ?? '').trim().toUpperCase(),
-    quota: String(body.quota || 'GN').trim().toUpperCase(),
-    source_station: String(body.source_station ?? body.sourceStation ?? '').trim().toUpperCase(),
-    destination_station: String(body.destination_station ?? body.destinationStation ?? '').trim().toUpperCase(),
-    threshold: Number.isFinite(threshold) ? threshold : 20,
+    class_code: optionCodeFromInput(body.class_code ?? body.classCode ?? body.classc, CLASS_OPTIONS),
+    quota: optionCodeFromInput(body.quota, QUOTA_OPTIONS),
+    source_station: stationCodeFromInput(body.source_station ?? body.sourceStation),
+    destination_station: stationCodeFromInput(body.destination_station ?? body.destinationStation),
+    threshold: Number.isFinite(threshold) ? threshold : 0,
+    invalid_threshold: !Number.isFinite(threshold) || !Number.isInteger(threshold),
     check_times: checkTimes,
-    max_triggers_per_day: Number.isFinite(maxTriggers) && maxTriggers > 0
-      ? Math.floor(maxTriggers)
-      : checkTimes.split(',').length,
-    is_active: body.is_active === undefined && body.isActive === undefined
-      ? 1
-      : Number(Boolean(body.is_active ?? body.isActive))
+    invalid_check_times: invalidCheckTimes(checkTimesInput),
+    invalid_start_date: !startDate,
+    booking_window_reminders: Number(Boolean(body.booking_window_reminders ?? body.bookingWindowReminders)),
+    is_active: isActive
   };
 }
 
 export function validateEventPayload(payload) {
-  const required = ['name', 'weekday', 'train_no', 'class_code', 'quota', 'source_station', 'destination_station'];
+  const required = ['name', 'train_no', 'class_code', 'quota', 'source_station', 'destination_station'];
+  if (payload.recurrence_type === 'weekly') required.push('weekday');
   const missing = required.filter((field) => !payload[field]);
-  if (missing.length) return `Missing required field(s): ${missing.join(', ')}`;
-  if (payload.threshold < 0) return 'Threshold must be zero or greater';
-  if (!payload.check_times) return 'At least one check time is required';
-  if (payload.max_triggers_per_day < 1) return 'Max triggers per day must be at least 1';
+  if (missing.length) {
+    return `Please fill: ${missing.map((field) => EVENT_FIELD_LABELS[field] || field).join(', ')}`;
+  }
+  if (!RECURRENCE_OPTIONS.some((option) => option.value === payload.recurrence_type)) return 'Choose a valid travel frequency';
+  if (payload.invalid_start_date || !/^\d{4}-\d{2}-\d{2}$/.test(payload.start_date)) return 'Start date must use YYYY-MM-DD';
+  if (!/^\d{4,6}$/.test(payload.train_no)) return 'Train number must be 4 to 6 digits';
+  if (!CLASS_OPTIONS.some((option) => option.value === payload.class_code)) return 'Choose a valid class';
+  if (!QUOTA_OPTIONS.some((option) => option.value === payload.quota)) return 'Choose a valid quota';
+  if (!/^[A-Z0-9]{2,6}$/.test(payload.source_station)) return 'From station must be a 2 to 6 character station code';
+  if (!/^[A-Z0-9]{2,6}$/.test(payload.destination_station)) return 'To station must be a 2 to 6 character station code';
+  if (payload.source_station === payload.destination_station) return 'From and To stations must be different';
+  if (payload.is_active && payload.invalid_threshold) return 'Seat alert limit is required for active monitoring';
+  if (payload.is_active && payload.threshold < 0) return 'Seat alert limit must be zero or greater';
+  if (payload.is_active && payload.invalid_check_times?.length) {
+    return `Invalid check time(s): ${payload.invalid_check_times.join(', ')}. Use HH:mm in 24-hour time.`;
+  }
+  if (payload.is_active && !payload.check_times) return 'At least one check time is required for active monitoring';
   return '';
 }

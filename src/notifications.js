@@ -4,25 +4,33 @@ import { clearNotifications as clearRows, createNotificationRow } from './databa
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
-    shouldShowAlert: true,
+    shouldShowBanner: true,
+    shouldShowList: true,
     shouldPlaySound: true,
     shouldSetBadge: true
   })
 });
 
 export async function configureNotifications() {
-  if (Platform.OS === 'android') {
-    await Notifications.setNotificationChannelAsync('availability-alerts', {
-      name: 'Availability alerts',
-      importance: Notifications.AndroidImportance.HIGH,
-      vibrationPattern: [0, 250, 250, 250],
-      lightColor: '#d7263d'
-    });
-  }
+  try {
+    if (Platform.OS === 'android') {
+      await Notifications.setNotificationChannelAsync('availability-alerts', {
+        name: 'Availability alerts',
+        importance: Notifications.AndroidImportance.HIGH,
+        vibrationPattern: [0, 250, 250, 250],
+        lightColor: '#d7263d'
+      });
+    }
 
-  const current = await Notifications.getPermissionsAsync();
-  if (current.status !== 'granted') {
-    await Notifications.requestPermissionsAsync();
+    const current = await Notifications.getPermissionsAsync();
+    if (current.status !== 'granted') {
+      const requested = await Notifications.requestPermissionsAsync();
+      return requested.status === 'granted' || requested.granted;
+    }
+    return current.status === 'granted' || current.granted;
+  } catch (err) {
+    console.warn('Native notification setup failed:', err.message);
+    return false;
   }
 }
 
@@ -36,15 +44,34 @@ export async function createAvailabilityNotification(
 ) {
   const id = await createNotificationRow(eventId, occurrenceId, message);
   if (native) {
-    await Notifications.scheduleNotificationAsync({
-      content: {
-        title,
-        body: message,
-        sound: true,
-        data
-      },
-      trigger: null
-    });
+    let canNotify = false;
+    try {
+      canNotify = await configureNotifications();
+    } catch (err) {
+      console.warn('Unable to configure native notifications:', err.message);
+    }
+
+    if (canNotify) {
+      try {
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title,
+            body: message,
+            sound: true,
+            data,
+            ...(Platform.OS === 'android'
+              ? {
+                  channelId: 'availability-alerts',
+                  priority: Notifications.AndroidNotificationPriority.HIGH
+                }
+              : {})
+          },
+          trigger: null
+        });
+      } catch (err) {
+        console.warn('Unable to show native notification:', err.message);
+      }
+    }
   }
   return id;
 }
@@ -57,6 +84,21 @@ export async function createCaptchaNotification(eventId, eventName, native = tru
     native,
     { type: 'captcha_required', eventId },
     'Captcha required'
+  );
+}
+
+export async function createBookingWindowReminderNotification(eventId, occurrenceId, eventName, daysBefore, native = true) {
+  const message = daysBefore === 1
+    ? `Booking opens tomorrow for "${eventName}". Ready to book your ticket.`
+    : `Booking opens in ${daysBefore} days for "${eventName}". Keep passenger details ready.`;
+
+  return createAvailabilityNotification(
+    eventId,
+    occurrenceId,
+    message,
+    native,
+    { type: 'booking_window_reminder', eventId, occurrenceId, daysBefore },
+    'Booking window reminder'
   );
 }
 
