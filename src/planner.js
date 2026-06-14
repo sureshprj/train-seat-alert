@@ -26,6 +26,7 @@ import {
   currentLocalTime,
   formatAvailabilitySummary,
   formatShortDate,
+  generateTravelDates,
   isBelowThresholdStatus,
   nowIso,
   parseAvailability
@@ -44,6 +45,12 @@ function alertSignature(parsed) {
     String(parsed.availability_status || '').trim().toUpperCase(),
     parsed.available_count ?? ''
   ].join('|');
+}
+
+function isTerminalAvailabilityError(statusText) {
+  return /no\s+valid\s+profile|valid\s+train\s+number|valid\s+station|invalid\s+train|invalid\s+station/i.test(
+    String(statusText || '')
+  );
 }
 
 function normalizeAvailabilityDate(value) {
@@ -173,6 +180,57 @@ async function recordOccurrenceFromRaw(row, raw, options = {}) {
   };
 }
 
+export async function validateTripAvailability(payload, options = {}) {
+  const travelDates = generateTravelDates(payload, ADVANCE_DAYS);
+  const travelDate = travelDates[0];
+  if (!travelDate) {
+    return {
+      valid: false,
+      message: 'No future travel date could be generated for this trip.'
+    };
+  }
+
+  const row = {
+    id: 0,
+    event_id: 0,
+    user_status: 'pending',
+    travel_date: travelDate,
+    train_no: payload.train_no,
+    class_code: payload.class_code,
+    quota: payload.quota,
+    source_station: payload.source_station,
+    destination_station: payload.destination_station,
+    threshold: payload.threshold
+  };
+
+  const response = await requestAvailability(row, {
+    validation: true,
+    inputCaptcha: options.inputCaptcha || ''
+  });
+  if (response.captchaRequired) {
+    return {
+      valid: false,
+      captchaRequired: true,
+      message: 'CAPTCHA is required before validating these trip details. Complete one seat check to activate the rail session, then save again.'
+    };
+  }
+
+  const parsed = parseAvailability(response.raw, travelDate);
+  if (isTerminalAvailabilityError(parsed.availability_status)) {
+    return {
+      valid: false,
+      message: parsed.availability_status
+    };
+  }
+
+  return {
+    valid: true,
+    travelDate,
+    availabilityStatus: parsed.availability_status,
+    availableCount: parsed.available_count
+  };
+}
+
 export async function checkEvent(eventId, options = {}) {
   const event = await getEvent(eventId);
   if (!event) return { notFound: true };
@@ -180,15 +238,19 @@ export async function checkEvent(eventId, options = {}) {
   const rows = await getPendingOccurrencesForEvent(eventId, {
     includeAllStatuses: Boolean(options.includeAllStatuses)
   });
+
   const results = [];
   const handledIds = new Set();
+  const sharedInputCaptcha = options.inputCaptcha && options.reuseInputCaptcha !== false
+    ? options.inputCaptcha
+    : '';
   for (let index = 0; index < rows.length; index += 1) {
     if (handledIds.has(rows[index].id)) continue;
 
     const result = await checkOccurrence(rows[index], {
       ...options,
       force: options.force || options.includeAllStatuses,
-      inputCaptcha: index === 0 ? options.inputCaptcha : ''
+      inputCaptcha: sharedInputCaptcha || (index === 0 ? options.inputCaptcha : '')
     });
 
     if (result.captchaRequired) {
@@ -200,7 +262,12 @@ export async function checkEvent(eventId, options = {}) {
     handledIds.add(rows[index].id);
 
     const responseDates = availabilityDatesFromRaw(result.raw);
-    if (!responseDates.size) continue;
+    if (!responseDates.size) {
+      if (isTerminalAvailabilityError(result.availabilityStatus)) {
+        break;
+      }
+      continue;
+    }
 
     for (let followIndex = index + 1; followIndex < rows.length; followIndex += 1) {
       const row = rows[followIndex];
@@ -265,7 +332,7 @@ export async function runDueScheduledChecksWithOptions(options = {}) {
     }
     if (!unrunDueTimes.length) continue;
 
-    const result = await checkEvent(event.id, { automated: true });
+    const result = await checkEvent(event.id, { automated: true, deepCheck: true });
     if (result.captchaRequired) {
       captchaRequired = true;
       await createCaptchaNotificationOncePerDay(event, runDate, options);
@@ -273,7 +340,9 @@ export async function runDueScheduledChecksWithOptions(options = {}) {
         checked,
         captchaRequired,
         captchaEventId: event.id,
-        captchaEventName: event.name
+        captchaEventName: event.name,
+        captchaRunDate: runDate,
+        captchaScheduledTimes: unrunDueTimes
       };
     } else {
       await recordRuns(event.id, runDate, unrunDueTimes);

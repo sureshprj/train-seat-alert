@@ -4,7 +4,7 @@ Standalone React Native + Expo mobile app for train seat alerts and booking-wind
 
 The app stores all data locally on the phone with `expo-sqlite`. It calls Indian Rail directly from the device, persists session cookies locally, asks for captcha only when the rail session is inactive, runs scheduled background checks through Expo background fetch, and raises native notifications for low availability, RAC, WL/RLWL, and captcha-required automation pauses.
 
-## Local Development With Expo Go
+## Local Development With A Custom Expo Dev Client
 
 1. Install dependencies:
 
@@ -13,15 +13,23 @@ The app stores all data locally on the phone with `expo-sqlite`. It calls Indian
    npm install
    ```
 
-2. Start Expo on your local network:
+2. Build and install a development client once for your device or emulator:
+
+   ```sh
+   npx expo run:android
+   ```
+
+   For iOS, use an EAS development build or `npx expo run:ios` on a configured Mac.
+
+3. Start Expo on your local network:
 
    ```sh
    npm start
    ```
 
-3. Open Expo Go on a real phone and scan the QR code.
+4. Open the installed development build and connect to the Metro server.
 
-Your phone and computer must be on the same Wi-Fi network. The mobile app does not use the local Express server.
+Your phone and computer must be on the same Wi-Fi network. This app uses `expo-dev-client` and `react-native-google-mobile-ads`, so Expo Go is not the reliable target. The mobile app does not use the local Express server.
 
 ## Current Feature Set
 
@@ -39,7 +47,25 @@ Your phone and computer must be on the same Wi-Fi network. The mobile app does n
 
 ## Notes
 
-Expo Go background execution is controlled by iOS/Android power rules, so scheduled checks may not fire exactly at the selected minute during local development. Manual `Check` remains the reliable validation path in Expo Go.
+Background execution is controlled by iOS/Android power rules, so scheduled checks may not fire exactly at the selected minute during local development. Manual `Check` remains the reliable validation path while developing.
+
+## Play Store Release Prep
+
+The Android app includes an in-app About screen with the unofficial-app disclaimer, data summary, AdMob notice, privacy-policy link, and support contact.
+
+Before submitting to production, replace the placeholder privacy URL and support email in `src/screens/AboutScreen.js`, publish `docs/privacy-policy.md` at that URL, and complete the Play Console checklist in `docs/play-store-readiness.md`.
+
+Build a production Android App Bundle with:
+
+```sh
+npx eas build --platform android --profile production
+```
+
+Run unit tests with:
+
+```sh
+npm test
+```
 
 If Expo reports package version mismatches, run:
 

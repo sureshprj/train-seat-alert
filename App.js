@@ -1,9 +1,10 @@
 import 'react-native-gesture-handler';
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   AppState,
+  Keyboard,
   KeyboardAvoidingView,
   Linking,
   Modal,
@@ -26,29 +27,28 @@ import * as ExpoNotifications from 'expo-notifications';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
-  clearAllNotifications,
   configureNotifications
 } from './src/notifications';
 import {
   createEvent,
-  deleteEvent,
   cleanupOldData,
   ensureFutureOccurrences,
   getEventsWithOccurrences,
   getNotifications,
+  getSetting,
   initDatabase,
   markNotificationRead,
-  updateEvent,
-  updateOccurrenceStatus
+  recordRuns,
+  setSetting,
+  updateEvent
 } from './src/database';
 import { registerBackgroundChecks } from './src/background';
 import {
-  fetchCaptchaImage,
   getSessionStatus,
   searchStationSuggestions,
   searchTrainSuggestions
 } from './src/railClient';
-import { checkEvent, checkOccurrence, runDueScheduledChecksWithOptions } from './src/planner';
+import { checkEvent, checkOccurrence, validateTripAvailability } from './src/planner';
 import {
   ADVANCE_DAYS,
   CLASS_OPTIONS,
@@ -56,8 +56,6 @@ import {
   RECURRENCE_OPTIONS,
   WEEKDAYS,
   formatAvailabilitySummary,
-  formatDateTime,
-  formatDisplayDate,
   isAvailableStatus,
   isBelowThresholdStatus,
   isNotAvailableStatus,
@@ -67,6 +65,13 @@ import {
   normalizeEventPayload,
   validateEventPayload
 } from './src/utils';
+import AdBanner from './src/AdBanner';
+import useCaptchaFlow from './src/hooks/useCaptchaFlow';
+import useForegroundCatchUp from './src/hooks/useForegroundCatchUp';
+import AlertsScreen from './src/screens/AlertsScreen';
+import AboutScreen from './src/screens/AboutScreen';
+import CalendarScreen from './src/screens/CalendarScreen';
+import TripsScreen from './src/screens/TripsScreen';
 
 const Tab = createBottomTabNavigator();
 const navigationRef = createNavigationContainerRef();
@@ -80,6 +85,9 @@ const IRCTC_RAIL_CONNECT_ACTIVITIES = [
 ];
 const IRCTC_RAIL_CONNECT_MARKET = `market://details?id=${IRCTC_RAIL_CONNECT_PACKAGE}`;
 const IRCTC_RAIL_CONNECT_STORE = `https://play.google.com/store/apps/details?id=${IRCTC_RAIL_CONNECT_PACKAGE}`;
+const AUTO_CAPTCHA_COOLDOWN_MS = 15 * 60 * 1000;
+const AUTO_CAPTCHA_COOLDOWN_SETTING_PREFIX = 'auto_captcha_cooldown_until_';
+const MANUAL_CHECK_AUTO_PAUSE_MS = 3 * 60 * 1000;
 
 const blankForm = {
   name: '',
@@ -87,13 +95,13 @@ const blankForm = {
   start_date: new Date().toISOString().slice(0, 10),
   weekday: 'Tuesday',
   train_no: '',
-  class_code: '',
-  quota: '',
+  class_code: 'SL',
+  quota: 'GN',
   source_station: '',
   destination_station: '',
   threshold: '',
-  check_times: '',
-  booking_window_reminders: false,
+  check_times: '08:00',
+  booking_window_reminders: true,
   is_active: true
 };
 
@@ -139,7 +147,7 @@ function IconButton({ icon, label, tone = 'primary', onPress, disabled, compact 
   );
 }
 
-function Field({ label, value, onChangeText, keyboardType = 'default', autoCapitalize = 'characters', placeholder }) {
+function Field({ label, value, onChangeText, keyboardType = 'default', autoCapitalize = 'characters', placeholder, onFocus }) {
   return (
     <View style={styles.field}>
       <Text style={styles.label}>{label}</Text>
@@ -151,12 +159,16 @@ function Field({ label, value, onChangeText, keyboardType = 'default', autoCapit
         autoCapitalize={autoCapitalize}
         placeholder={placeholder}
         placeholderTextColor="#8a94a6"
+        onFocus={() => {
+          onFocus?.();
+        }}
       />
     </View>
   );
 }
 
 function AutocompleteField({
+  id,
   label,
   value,
   onChangeText,
@@ -165,14 +177,18 @@ function AutocompleteField({
   minQueryLength = 2,
   keyboardType = 'default',
   autoCapitalize = 'characters',
-  placeholder
+  placeholder,
+  activeId,
+  onActivate,
+  onDismiss
 }) {
-  const [focused, setFocused] = useState(false);
+  const inputRef = useRef(null);
   const [suggestions, setSuggestions] = useState([]);
   const [loading, setLoading] = useState(false);
+  const isActive = activeId === id;
 
   useEffect(() => {
-    if (!focused) {
+    if (!isActive) {
       setSuggestions([]);
       return undefined;
     }
@@ -183,48 +199,54 @@ function AutocompleteField({
       return undefined;
     }
 
-    let active = true;
+    let requestActive = true;
     const timer = setTimeout(async () => {
       try {
         setLoading(true);
         const rows = await searchSuggestions(query);
-        if (active) setSuggestions(rows);
+        if (requestActive) setSuggestions(rows);
       } catch {
-        if (active) setSuggestions([]);
+        if (requestActive) setSuggestions([]);
       } finally {
-        if (active) setLoading(false);
+        if (requestActive) setLoading(false);
       }
     }, 250);
 
     return () => {
-      active = false;
+      requestActive = false;
       clearTimeout(timer);
     };
-  }, [focused, minQueryLength, searchSuggestions, value]);
+  }, [isActive, minQueryLength, searchSuggestions, value]);
 
   function selectSuggestion(item) {
+    inputRef.current?.blur();
+    Keyboard.dismiss();
     onSelect(item);
-    setFocused(false);
+    onDismiss(id);
     setSuggestions([]);
   }
 
   return (
-    <View style={styles.field}>
+    <View style={[styles.field, styles.autocompleteField, isActive && styles.autocompleteFieldActive]}>
       <Text style={styles.label}>{label}</Text>
       <TextInput
+        ref={inputRef}
         style={styles.input}
         value={String(value)}
         onChangeText={(text) => {
           onChangeText(text);
-          setFocused(true);
+          onActivate(id);
         }}
-        onFocus={() => setFocused(true)}
+        onFocus={() => onActivate(id)}
+        onBlur={() => {
+          setTimeout(() => onDismiss(id), 160);
+        }}
         keyboardType={keyboardType}
         autoCapitalize={autoCapitalize}
         placeholder={placeholder}
         placeholderTextColor="#8a94a6"
       />
-      {focused && (loading || suggestions.length > 0) && (
+      {isActive && (loading || suggestions.length > 0) && (
         <View style={styles.suggestionList}>
           {loading && !suggestions.length ? (
             <Text style={styles.suggestionMeta}>Searching...</Text>
@@ -241,6 +263,23 @@ function AutocompleteField({
         </View>
       )}
     </View>
+  );
+}
+
+function ToggleSelection({ label, description, value, onValueChange }) {
+  return (
+    <Pressable
+      style={[styles.toggleSelection, value && styles.toggleSelectionActive]}
+      onPress={() => onValueChange(!value)}
+    >
+      <View style={styles.switchRow}>
+        <Text style={[styles.toggleSelectionLabel, value && styles.toggleSelectionTextActive]}>{label}</Text>
+        <Switch value={value} onValueChange={onValueChange} />
+      </View>
+      <Text style={[styles.toggleSelectionDescription, value && styles.toggleSelectionDescriptionActive]}>
+        {description}
+      </Text>
+    </Pressable>
   );
 }
 
@@ -702,10 +741,12 @@ function isCaptchaNotification(notification) {
   return /captcha required/i.test(notification?.message || '');
 }
 
-function EventFormModal({ visible, editingEvent, onClose, onSaved }) {
+function EventFormModal({ visible, editingEvent, onClose, onSaveTrip }) {
+  const insets = useSafeAreaInsets();
   const [form, setForm] = useState(blankForm);
   const [saving, setSaving] = useState(false);
   const [formTouched, setFormTouched] = useState(false);
+  const [activeAutocompleteId, setActiveAutocompleteId] = useState(null);
   const formValidationMessage = useMemo(() => {
     try {
       return validateEventPayload(normalizeEventPayload({ ...form, is_active: form.is_active }));
@@ -719,6 +760,7 @@ function EventFormModal({ visible, editingEvent, onClose, onSaved }) {
   useEffect(() => {
     if (!visible) return;
     setFormTouched(false);
+    setActiveAutocompleteId(null);
     setForm(editingEvent ? {
       name: editingEvent.name,
       recurrence_type: normalizeRecurrenceType(editingEvent.recurrence_type),
@@ -730,7 +772,7 @@ function EventFormModal({ visible, editingEvent, onClose, onSaved }) {
       source_station: editingEvent.source_station,
       destination_station: editingEvent.destination_station,
       threshold: String(editingEvent.threshold),
-      check_times: editingEvent.check_times || '',
+      check_times: editingEvent.check_times || '08:00',
       booking_window_reminders: Boolean(editingEvent.booking_window_reminders),
       is_active: Boolean(editingEvent.is_active)
     } : blankForm);
@@ -741,18 +783,30 @@ function EventFormModal({ visible, editingEvent, onClose, onSaved }) {
     setForm((current) => ({ ...current, [key]: value }));
   }
 
+  function dismissAutocomplete(expectedId) {
+    setActiveAutocompleteId((current) => {
+      if (expectedId && current !== expectedId) return current;
+      return null;
+    });
+  }
+
+  function rowHasActiveAutocomplete(ids) {
+    return ids.includes(activeAutocompleteId);
+  }
+
   async function save() {
     try {
       setSaving(true);
-      const payload = {
+      const body = {
         ...form,
         is_active: form.is_active
       };
-      const saved = editingEvent
-        ? await updateEvent(editingEvent.id, payload)
-        : await createEvent(payload);
-      await onSaved(saved.id);
-      onClose();
+      const payload = normalizeEventPayload(body);
+      const validationError = validateEventPayload(payload);
+      if (validationError) throw new Error(validationError);
+
+      const result = await onSaveTrip(body, editingEvent?.id || null);
+      if (result?.pendingCaptcha) return;
     } catch (err) {
       Alert.alert('Unable to save trip', err.message);
     } finally {
@@ -763,22 +817,37 @@ function EventFormModal({ visible, editingEvent, onClose, onSaved }) {
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet">
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalRoot}>
-        <View style={styles.modalHeader}>
+        <View style={[styles.modalHeader, { paddingTop: Math.max(insets.top, 12) + 8 }]}>
           <Text style={styles.modalTitle}>{editingEvent ? 'Edit Trip' : 'Create Trip'}</Text>
           <TouchableOpacity onPress={onClose} style={styles.iconOnly}>
             <Ionicons name="close" size={24} color="#1d3557" />
           </TouchableOpacity>
         </View>
 
-        <ScrollView contentContainerStyle={styles.modalBody} keyboardShouldPersistTaps="handled">
-          <Field label="Trip name" value={form.name} onChangeText={(value) => setField('name', value)} autoCapitalize="words" />
+        <ScrollView
+          contentContainerStyle={[
+            styles.modalBody,
+            { paddingBottom: 36 + Math.max(insets.bottom, 12) }
+          ]}
+          keyboardShouldPersistTaps="handled"
+        >
+          <Field
+            label="Trip name"
+            value={form.name}
+            onChangeText={(value) => setField('name', value)}
+            autoCapitalize="words"
+            onFocus={dismissAutocomplete}
+          />
 
           <Text style={styles.label}>Travel frequency</Text>
           <View style={styles.recurrenceGrid}>
             {RECURRENCE_OPTIONS.map((option) => (
               <Pressable
                 key={option.value}
-                onPress={() => setField('recurrence_type', option.value)}
+                onPress={() => {
+                  dismissAutocomplete();
+                  setField('recurrence_type', option.value);
+                }}
                 style={[styles.recurrenceChip, form.recurrence_type === option.value && styles.weekdayChipSelected]}
               >
                 <Text style={[styles.weekdayText, form.recurrence_type === option.value && styles.weekdayTextSelected]}>
@@ -795,7 +864,10 @@ function EventFormModal({ visible, editingEvent, onClose, onSaved }) {
                 {WEEKDAYS.map((weekday) => (
                   <Pressable
                     key={weekday}
-                    onPress={() => setField('weekday', weekday)}
+                    onPress={() => {
+                      dismissAutocomplete();
+                      setField('weekday', weekday);
+                    }}
                     style={[styles.weekdayChip, form.weekday === weekday && styles.weekdayChipSelected]}
                   >
                     <Text style={[styles.weekdayText, form.weekday === weekday && styles.weekdayTextSelected]}>
@@ -812,10 +884,12 @@ function EventFormModal({ visible, editingEvent, onClose, onSaved }) {
               onChangeText={(value) => setField('start_date', value)}
               autoCapitalize="none"
               placeholder="YYYY-MM-DD"
+              onFocus={dismissAutocomplete}
             />
           )}
 
           <AutocompleteField
+            id="train_no"
             label="Train"
             value={form.train_no}
             onChangeText={(value) => setField('train_no', value)}
@@ -823,10 +897,14 @@ function EventFormModal({ visible, editingEvent, onClose, onSaved }) {
             searchSuggestions={searchTrainSuggestions}
             autoCapitalize="characters"
             placeholder="Train no or name"
+            activeId={activeAutocompleteId}
+            onActivate={setActiveAutocompleteId}
+            onDismiss={dismissAutocomplete}
           />
 
-          <View style={styles.twoCol}>
+          <View style={[styles.twoCol, rowHasActiveAutocomplete(['class_code', 'quota']) && styles.twoColActive]}>
             <AutocompleteField
+              id="class_code"
               label="Class"
               value={form.class_code}
               onChangeText={(value) => setField('class_code', value)}
@@ -835,8 +913,12 @@ function EventFormModal({ visible, editingEvent, onClose, onSaved }) {
               minQueryLength={0}
               autoCapitalize="characters"
               placeholder="SL, 3A, AC..."
+              activeId={activeAutocompleteId}
+              onActivate={setActiveAutocompleteId}
+              onDismiss={dismissAutocomplete}
             />
             <AutocompleteField
+              id="quota"
               label="Quota"
               value={form.quota}
               onChangeText={(value) => setField('quota', value)}
@@ -845,10 +927,14 @@ function EventFormModal({ visible, editingEvent, onClose, onSaved }) {
               minQueryLength={0}
               autoCapitalize="characters"
               placeholder="GN, Tatkal..."
+              activeId={activeAutocompleteId}
+              onActivate={setActiveAutocompleteId}
+              onDismiss={dismissAutocomplete}
             />
           </View>
-          <View style={styles.twoCol}>
+          <View style={[styles.twoCol, rowHasActiveAutocomplete(['source_station', 'destination_station']) && styles.twoColActive]}>
             <AutocompleteField
+              id="source_station"
               label="From station"
               value={form.source_station}
               onChangeText={(value) => setField('source_station', value)}
@@ -856,8 +942,12 @@ function EventFormModal({ visible, editingEvent, onClose, onSaved }) {
               searchSuggestions={searchStationSuggestions}
               autoCapitalize="characters"
               placeholder="Code or name"
+              activeId={activeAutocompleteId}
+              onActivate={setActiveAutocompleteId}
+              onDismiss={dismissAutocomplete}
             />
             <AutocompleteField
+              id="destination_station"
               label="To station"
               value={form.destination_station}
               onChangeText={(value) => setField('destination_station', value)}
@@ -865,31 +955,31 @@ function EventFormModal({ visible, editingEvent, onClose, onSaved }) {
               searchSuggestions={searchStationSuggestions}
               autoCapitalize="characters"
               placeholder="Code or name"
+              activeId={activeAutocompleteId}
+              onActivate={setActiveAutocompleteId}
+              onDismiss={dismissAutocomplete}
             />
           </View>
-          <Field label="Alert when seats are ≤" value={form.threshold} onChangeText={(value) => setField('threshold', value)} keyboardType="number-pad" />
+          <Field
+            label="Alert when seats are ≤"
+            value={form.threshold}
+            onChangeText={(value) => setField('threshold', value)}
+            keyboardType="number-pad"
+            onFocus={dismissAutocomplete}
+          />
           <CheckTimesPicker value={form.check_times} onChange={(value) => setField('check_times', value)} />
-          <View style={styles.switchField}>
-            <View style={styles.switchRow}>
-              <Text style={styles.label}>Seat alerts</Text>
-              <Switch value={form.is_active} onValueChange={(value) => setField('is_active', value)} />
-            </View>
-            <Text style={styles.switchDescription}>
-              Checks seat availability at your selected times and sends alerts when seats match your alert rule.
-            </Text>
-          </View>
-          <View style={styles.switchField}>
-            <View style={styles.switchRow}>
-              <Text style={styles.label}>Booking window reminders</Text>
-              <Switch
-                value={form.booking_window_reminders}
-                onValueChange={(value) => setField('booking_window_reminders', value)}
-              />
-            </View>
-            <Text style={styles.switchDescription}>
-              Sends reminders 2 days and 1 day before booking opens for this trip.
-            </Text>
-          </View>
+          <ToggleSelection
+            label="Seat alerts"
+            value={form.is_active}
+            onValueChange={(value) => setField('is_active', value)}
+            description="Checks seat availability at your selected times and sends alerts when seats match your alert rule."
+          />
+          <ToggleSelection
+            label="Booking window reminders"
+            value={form.booking_window_reminders}
+            onValueChange={(value) => setField('booking_window_reminders', value)}
+            description="Sends reminders 2 days and 1 day before booking opens for this trip."
+          />
 
           {showValidationMessage ? (
             <Text style={styles.formValidationText}>{formValidationMessage}</Text>
@@ -959,12 +1049,11 @@ function TripPlannerApp() {
   const [formVisible, setFormVisible] = useState(false);
   const [editingEvent, setEditingEvent] = useState(null);
   const [busy, setBusy] = useState(false);
-  const [captchaVisible, setCaptchaVisible] = useState(false);
-  const [captchaImage, setCaptchaImage] = useState('');
-  const [captchaValue, setCaptchaValue] = useState('');
-  const [captchaLoading, setCaptchaLoading] = useState(false);
-  const [pendingCheck, setPendingCheck] = useState(null);
+  const [loadingStatus, setLoadingStatus] = useState(null);
   const [nativeNotificationsEnabled, setNativeNotificationsEnabled] = useState(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const autoCaptchaCooldownUntilByEventRef = useMemo(() => new Map(), []);
+  const autoChecksPausedUntilRef = useRef(0);
 
   const selectedEvent = useMemo(
     () => events.find((event) => event.id === selectedEventId) || null,
@@ -980,42 +1069,102 @@ function TripPlannerApp() {
     }
   }, []);
 
-  const refresh = useCallback(async () => {
-    await ensureFutureOccurrences();
-    const [eventRows, notificationRows, status] = await Promise.all([
-      getEventsWithOccurrences(),
-      getNotifications(50),
-      getSessionStatus()
-    ]);
-    setEvents(eventRows);
-    setNotifications(notificationRows);
-    setSessionStatus(status);
-    setSelectedEventId((current) => {
-      if (current && eventRows.some((event) => event.id === current)) return current;
-      return eventRows[0]?.id || null;
-    });
-    await refreshNotificationPermissionStatus();
+  const refresh = useCallback(async ({ showLoading = false } = {}) => {
+    if (showLoading) setRefreshing(true);
+    try {
+      await ensureFutureOccurrences();
+      const [eventRows, notificationRows, status] = await Promise.all([
+        getEventsWithOccurrences(),
+        getNotifications(50),
+        getSessionStatus()
+      ]);
+      setEvents(eventRows);
+      setNotifications(notificationRows);
+      setSessionStatus(status);
+      setSelectedEventId((current) => {
+        if (current && eventRows.some((event) => event.id === current)) return current;
+        return eventRows[0]?.id || null;
+      });
+      await refreshNotificationPermissionStatus();
+    } finally {
+      if (showLoading) setRefreshing(false);
+    }
   }, [refreshNotificationPermissionStatus]);
 
-  const runForegroundCatchUp = useCallback(async () => {
-    if (!ready) return;
-    if (captchaVisible || pendingCheck) return;
-    try {
-      const result = await runDueScheduledChecksWithOptions({ suppressCaptchaNotifications: true });
-      if (result.captchaRequired && result.captchaEventId) {
-        await refresh();
-        await openCaptcha({
-          type: 'event',
-          eventId: result.captchaEventId,
-          suppressNotifications: false
-        });
-        return;
-      }
-      if (result.checked > 0 || result.reminded > 0) await refresh();
-    } catch (err) {
-      console.warn('Foreground catch-up failed:', err.message);
+  function autoCaptchaCooldownSettingKey(eventId) {
+    return `${AUTO_CAPTCHA_COOLDOWN_SETTING_PREFIX}${Number(eventId)}`;
+  }
+
+  const isAutoCaptchaCoolingDown = useCallback(async (eventId) => {
+    const numericEventId = Number(eventId);
+    if (!numericEventId) return false;
+
+    let cooldownUntil = autoCaptchaCooldownUntilByEventRef.get(numericEventId);
+    if (!cooldownUntil) {
+      cooldownUntil = Number(await getSetting(autoCaptchaCooldownSettingKey(numericEventId), '0')) || 0;
+      if (cooldownUntil) autoCaptchaCooldownUntilByEventRef.set(numericEventId, cooldownUntil);
     }
-  }, [ready, refresh, captchaVisible, pendingCheck]);
+
+    if (Date.now() < cooldownUntil) return true;
+
+    if (cooldownUntil) {
+      autoCaptchaCooldownUntilByEventRef.delete(numericEventId);
+      await setSetting(autoCaptchaCooldownSettingKey(numericEventId), '0');
+    }
+    return false;
+  }, [autoCaptchaCooldownUntilByEventRef]);
+
+  const startAutoCaptchaCooldown = useCallback(async (eventId) => {
+    const numericEventId = Number(eventId);
+    if (!numericEventId) return;
+    const cooldownUntil = Date.now() + AUTO_CAPTCHA_COOLDOWN_MS;
+    autoCaptchaCooldownUntilByEventRef.set(numericEventId, cooldownUntil);
+    await setSetting(autoCaptchaCooldownSettingKey(numericEventId), String(cooldownUntil));
+  }, [autoCaptchaCooldownUntilByEventRef]);
+
+  const clearAutoCaptchaCooldown = useCallback(async (eventId) => {
+    const numericEventId = Number(eventId);
+    if (!numericEventId) return;
+    autoCaptchaCooldownUntilByEventRef.delete(numericEventId);
+    await setSetting(autoCaptchaCooldownSettingKey(numericEventId), '0');
+  }, [autoCaptchaCooldownUntilByEventRef]);
+
+  const pauseAutoChecksAfterManualCheck = useCallback(() => {
+    autoChecksPausedUntilRef.current = Date.now() + MANUAL_CHECK_AUTO_PAUSE_MS;
+  }, []);
+
+  const isAutoCheckPaused = useCallback(() => {
+    return Date.now() < autoChecksPausedUntilRef.current;
+  }, []);
+
+  const {
+    captchaVisible,
+    captchaImage,
+    captchaValue,
+    captchaLoading,
+    pendingCheck,
+    setCaptchaValue,
+    openCaptcha,
+    reloadCaptcha,
+    hideCaptcha,
+    reopenCaptcha,
+    resetCaptcha,
+    cancelCaptcha
+  } = useCaptchaFlow({
+    refresh,
+    clearAutoCaptchaCooldown,
+    startAutoCaptchaCooldown
+  });
+
+  const { autoChecking, runForegroundCatchUp } = useForegroundCatchUp({
+    ready,
+    captchaVisible,
+    pendingCheck,
+    refresh,
+    openCaptcha,
+    isAutoCaptchaCoolingDown,
+    isAutoCheckPaused
+  });
 
   useEffect(() => {
     (async () => {
@@ -1025,8 +1174,7 @@ function TripPlannerApp() {
         await cleanupOldData();
         setNativeNotificationsEnabled(await configureNotifications());
         await registerBackgroundChecks();
-        await runDueScheduledChecksWithOptions({ suppressCaptchaNotifications: true });
-        await refresh();
+        await refresh({ showLoading: true });
       } catch (err) {
         Alert.alert('Startup failed', err.message);
       } finally {
@@ -1066,17 +1214,11 @@ function TripPlannerApp() {
     return () => subscription.remove();
   }, [ready]);
 
-  async function openCaptcha(check) {
-    setPendingCheck(check);
-    setCaptchaVisible(true);
-    setCaptchaValue('');
-    await reloadCaptcha();
-  }
-
   async function openCaptchaForEvent(eventId, fromNotification = false) {
     const numericEventId = Number(eventId);
     if (!numericEventId) return;
     setSelectedEventId(numericEventId);
+    await clearAutoCaptchaCooldown(numericEventId);
     if (navigationRef.isReady()) {
       navigationRef.navigate('Alerts');
     }
@@ -1085,18 +1227,6 @@ function TripPlannerApp() {
       eventId: numericEventId,
       suppressNotifications: !fromNotification
     });
-  }
-
-  async function reloadCaptcha() {
-    try {
-      setCaptchaLoading(true);
-      setCaptchaImage(await fetchCaptchaImage());
-      await refresh();
-    } catch (err) {
-      Alert.alert('Unable to load captcha', err.message);
-    } finally {
-      setCaptchaLoading(false);
-    }
   }
 
   function buildOccurrenceRow(event, occurrence) {
@@ -1120,6 +1250,7 @@ function TripPlannerApp() {
       await openCaptcha({ type: 'event', eventId: event.id, suppressNotifications: false });
       return result;
     }
+    pauseAutoChecksAfterManualCheck();
     await refresh();
     Alert.alert('Check complete', `${result.checked || 0} occurrence(s) checked.`);
     return result;
@@ -1150,6 +1281,7 @@ function TripPlannerApp() {
       checkedEvents += 1;
     }
 
+    pauseAutoChecksAfterManualCheck();
     await refresh();
     Alert.alert('Checks complete', `${checked} occurrence(s) checked across ${checkedEvents} active trip(s).`);
     return { paused: false, checked, checkedEvents };
@@ -1171,36 +1303,103 @@ function TripPlannerApp() {
       await openCaptcha({ type: 'occurrence', eventId: event.id, occurrenceId: occurrence.id });
       return result;
     }
+    pauseAutoChecksAfterManualCheck();
     await refresh();
     Alert.alert('Check complete', result.availabilitySummary || result.availabilityStatus || 'No availability status returned');
     return result;
   }
 
+  async function saveEventFromForm(body, editingEventId = null, inputCaptcha = '') {
+    const payload = normalizeEventPayload(body);
+    const validationError = validateEventPayload(payload);
+    if (validationError) throw new Error(validationError);
+
+    const railValidation = await validateTripAvailability(payload, { inputCaptcha });
+    if (railValidation.captchaRequired) {
+      if (inputCaptcha) throw new Error('Captcha was not accepted. Try again.');
+      await openCaptcha({
+        type: 'save-event',
+        body,
+        editingEventId
+      });
+      return { pendingCaptcha: true };
+    }
+    if (!railValidation.valid) {
+      throw new Error(`Indian Rail validation failed: ${railValidation.message}`);
+    }
+
+    const saved = editingEventId
+      ? await updateEvent(editingEventId, body)
+      : await createEvent(body);
+    setSelectedEventId(saved.id);
+
+    const immediateCheck = await checkEvent(saved.id, {
+      inputCaptcha,
+      suppressNotifications: false,
+      deepCheck: true
+    });
+
+    await refresh();
+    setFormVisible(false);
+    if (immediateCheck.captchaRequired) {
+      await openCaptcha({
+        type: 'event',
+        eventId: saved.id,
+        suppressNotifications: false
+      });
+      return { saved, pendingCaptcha: true };
+    }
+    return { saved };
+  }
+
   async function submitCaptcha() {
     if (!pendingCheck || !captchaValue.trim()) return;
+    const submittedCaptcha = captchaValue.trim();
+    hideCaptcha();
     try {
       setBusy(true);
+      setLoadingStatus({
+        title: 'Checking seat availability',
+        detail: 'Submitting CAPTCHA and continuing the pending check.'
+      });
+
+      if (pendingCheck.type === 'save-event') {
+        setLoadingStatus({
+          title: 'Validating trip details',
+          detail: 'Submitting CAPTCHA and checking the first generated travel date.'
+        });
+        await saveEventFromForm(
+          pendingCheck.body,
+          pendingCheck.editingEventId || null,
+          submittedCaptcha
+        );
+        resetCaptcha();
+        return;
+      }
+
       const event = events.find((item) => item.id === pendingCheck.eventId);
       if (!event) throw new Error('Trip not found for pending check');
 
       if (pendingCheck.type === 'event') {
         const result = await checkEvent(event.id, {
-          inputCaptcha: captchaValue.trim(),
+          inputCaptcha: submittedCaptcha,
           suppressNotifications: Boolean(pendingCheck.suppressNotifications),
           deepCheck: true,
           includeAllStatuses: Boolean(pendingCheck.includeAllStatuses)
         });
         if (result.captchaRequired) throw new Error('Captcha was not accepted. Try again.');
-
+        if (pendingCheck.automated && pendingCheck.runDate && pendingCheck.scheduledTimes?.length) {
+          await recordRuns(event.id, pendingCheck.runDate, pendingCheck.scheduledTimes);
+        }
+        pauseAutoChecksAfterManualCheck();
         const resumeEventIds = pendingCheck.resumeEventIds || [];
         if (resumeEventIds.length) {
           const remainingEvents = resumeEventIds
             .map((id) => events.find((item) => item.id === id))
             .filter(Boolean);
 
-          setCaptchaVisible(false);
-          setPendingCheck(null);
-          setCaptchaValue('');
+          resetCaptcha();
+          await clearAutoCaptchaCooldown(event.id);
           await runEventCheckBatch(
             remainingEvents,
             (pendingCheck.checkedSoFar || 0) + (result.checked || 0),
@@ -1213,31 +1412,42 @@ function TripPlannerApp() {
         const occurrence = event.occurrences.find((item) => item.id === pendingCheck.occurrenceId);
         if (!occurrence) throw new Error('Occurrence not found for pending check');
         const result = await checkOccurrence(buildOccurrenceRow(event, occurrence), {
-          inputCaptcha: captchaValue.trim(),
+          inputCaptcha: submittedCaptcha,
           force: true
         });
         if (result.captchaRequired) throw new Error('Captcha was not accepted. Try again.');
+        pauseAutoChecksAfterManualCheck();
       }
 
-      setCaptchaVisible(false);
-      setPendingCheck(null);
-      setCaptchaValue('');
+      resetCaptcha();
+      await clearAutoCaptchaCooldown(event.id);
       await refresh();
     } catch (err) {
-      Alert.alert('Captcha check failed', err.message);
-      await reloadCaptcha();
+      const captchaError = /captcha/i.test(err.message || '');
+      if (captchaError) {
+        await reopenCaptcha();
+      } else {
+        resetCaptcha();
+      }
+      Alert.alert(
+        pendingCheck?.type === 'save-event' && !captchaError ? 'Unable to save trip' : 'Captcha check failed',
+        err.message
+      );
     } finally {
+      setLoadingStatus(null);
       setBusy(false);
     }
   }
 
-  async function withBusy(fn) {
+  async function withBusy(fn, status = null) {
     try {
       setBusy(true);
+      setLoadingStatus(status);
       await fn();
     } catch (err) {
       Alert.alert('Request failed', err.message);
     } finally {
+      setLoadingStatus(null);
       setBusy(false);
     }
   }
@@ -1306,255 +1516,6 @@ function TripPlannerApp() {
     }
   }
 
-  function EventsScreen() {
-    return (
-      <Screen>
-        <View style={styles.topBar}>
-          <View style={styles.flexOne}>
-            <Text style={styles.screenTitle}>Trips</Text>
-            <Text style={styles.subtle}>{sessionStatus.isActive ? 'Rail session active' : 'Captcha needed before checks'}</Text>
-            <Text style={styles.subtle}>
-              Native notifications {nativeNotificationsEnabled ? 'enabled' : 'disabled'}
-            </Text>
-          </View>
-          <View style={styles.topBarActions}>
-            <TouchableOpacity
-              style={[styles.iconOnlyStrong, (busy || !events.length) && styles.buttonDisabled]}
-              onPress={() => withBusy(runAllEventChecks)}
-              disabled={busy || !events.length}
-            >
-              <Ionicons name="flash-outline" size={20} color="#fff" />
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.addButton}
-              onPress={() => {
-                setEditingEvent(null);
-                setFormVisible(true);
-              }}
-            >
-              <Ionicons name="add" size={24} color="#fff" />
-            </TouchableOpacity>
-          </View>
-        </View>
-
-        {!events.length ? (
-          <EmptyState title="No trips yet" body="Create a recurring train trip to generate travel dates." />
-        ) : events.map((event) => (
-	          <TouchableOpacity
-	            key={event.id}
-	            style={[styles.card, selectedEventId === event.id && styles.cardSelected]}
-	            onPress={() => openEventCalendar(event.id)}
-	            activeOpacity={0.85}
-	          >
-            <View style={styles.cardHeader}>
-              <Text style={styles.cardTitle}>{event.name}</Text>
-              <Pill label={event.is_active ? 'Active' : 'Inactive'} tone={event.is_active ? 'success' : 'neutral'} />
-            </View>
-            <Text style={styles.primaryLine}>{eventRecurrenceLabel(event)} · {event.train_no}</Text>
-            <Text style={styles.metaLine}>{event.source_station} → {event.destination_station}</Text>
-            <Text style={styles.metaLine}>{event.class_code} / {event.quota} · alert when seats are ≤ {event.threshold}</Text>
-            {normalizeRecurrenceType(event.recurrence_type) !== 'weekly' && (
-              <Text style={styles.metaLine}>Start date: {event.start_date}</Text>
-            )}
-            <Text style={styles.metaLine}>
-              Booking reminders: {event.booking_window_reminders ? 'enabled' : 'disabled'}
-            </Text>
-            <Text style={styles.metaLine}>Last checked: {formatDateTime(eventLastCheckedAt(event))}</Text>
-            <Text style={styles.metaLine}>Next check: {nextCheckText(event)}</Text>
-            <Text style={styles.metaLine}>Seat checks: {event.check_times}</Text>
-            <View style={styles.rowActions}>
-              <IconButton icon="flash-outline" label="Check" onPress={() => withBusy(() => runEventCheck(event, '', false))} disabled={busy} />
-            </View>
-            <View style={styles.rowActions}>
-              <IconButton
-                icon="create-outline"
-                label="Edit"
-                tone="secondary"
-                onPress={() => {
-                  setEditingEvent(event);
-                  setFormVisible(true);
-                }}
-              />
-              <IconButton
-                icon="trash-outline"
-                label="Delete"
-                tone="danger"
-                onPress={() => Alert.alert('Delete trip?', event.name, [
-                  { text: 'Cancel', style: 'cancel' },
-                  {
-                    text: 'Delete',
-                    style: 'destructive',
-                    onPress: () => withBusy(async () => {
-                      await deleteEvent(event.id);
-                      await refresh();
-                    })
-                  }
-                ])}
-              />
-            </View>
-          </TouchableOpacity>
-        ))}
-      </Screen>
-    );
-  }
-
-  function OccurrencesScreen() {
-    const windowInfo = selectedEvent ? bookingWindowInfo(selectedEvent) : null;
-
-    return (
-      <Screen>
-        <View style={styles.topBar}>
-          <View style={styles.flexOne}>
-            <Text style={styles.screenTitle}>Trip Calendar</Text>
-            <Text style={styles.subtle}>
-              {selectedEvent ? `${selectedEvent.name}: ${selectedEvent.occurrences.length} generated dates` : 'Select a trip first'}
-            </Text>
-          </View>
-          {selectedEvent && (
-            <TouchableOpacity style={styles.iconOnlyStrong} onPress={() => withBusy(() => runEventCheck(selectedEvent))}>
-              <Ionicons name="flash-outline" size={20} color="#fff" />
-            </TouchableOpacity>
-          )}
-        </View>
-
-	        {!selectedEvent ? (
-	          <EmptyState title="No trip selected" body="Choose a trip on the Trips tab to see its travel dates." />
-	        ) : (
-          <>
-            {selectedEvent.occurrences.map((occurrence) => {
-              const visualState = occurrenceVisualState(occurrence, selectedEvent);
-              const availabilityText = calendarAvailabilityText(occurrence);
-              const availabilityValue = calendarAvailabilityValue(occurrence);
-              return (
-                <View key={occurrence.id} style={[
-                  styles.card,
-                  styles[`occurrenceCard_${visualState}`]
-                ]}>
-                  <View style={styles.cardHeader}>
-                    <View style={styles.occurrenceHeaderTitle}>
-                      <Text style={styles.cardTitle}>{formatDisplayDate(occurrence.travel_date)}</Text>
-                      <Text style={styles.subtle}>{occurrence.travel_date}</Text>
-                    </View>
-                  <View style={styles.occurrenceHeaderActions}>
-                    <IrctcLinkButton onPress={() => openRailConnect(selectedEvent, occurrence)} />
-                    <Pill
-                      label={occurrenceVisualLabel(visualState)}
-                      tone={visualState}
-                    />
-                  </View>
-  	              </View>
-  	              <View style={styles.availabilityRow}>
-  	                <View style={styles.availabilityTextBlock}>
-  	                  <Text style={styles.primaryLine}>{availabilityText}</Text>
-  	                  <Text style={styles.metaLine}>Status: {occurrence.availability_status || 'No status yet'}</Text>
-  	                </View>
-  	                <Text style={[
-  	                  styles.availabilityValue,
-  	                  styles[`availabilityValue_${visualState}`]
-  	                ]}>
-  	                  {availabilityValue}
-  	                </Text>
-  	              </View>
-  	              <Text style={styles.metaLine}>Last checked: {formatDateTime(occurrence.last_checked_at)}</Text>
-                {occurrence.user_status !== 'pending' && (
-                  <Text style={styles.metaLine}>User status: {occurrence.user_status}</Text>
-                )}
-                <View style={styles.compactActions}>
-                  <IconButton
-                    icon="flash-outline"
-  	                  label="Check"
-  	                  compact
-  	                  onPress={() => withBusy(() => runOccurrenceCheck(selectedEvent, occurrence))}
-  	                  disabled={busy}
-  	                />
-                  <IconButton
-                    icon="ticket-outline"
-                    label="Booked"
-                    tone="secondary"
-                    compact
-                    onPress={() => withBusy(async () => {
-                      await updateOccurrenceStatus(occurrence.id, 'booked');
-                      await refresh();
-                    })}
-                  />
-                  <IconButton
-                    icon="remove-circle-outline"
-                    label="Ignore"
-                    tone="secondary"
-                    compact
-                    onPress={() => withBusy(async () => {
-                      await updateOccurrenceStatus(occurrence.id, 'ignored');
-                      await refresh();
-                    })}
-                  />
-                </View>
-              </View>
-            );
-          })}
-            {windowInfo && (
-              <View style={[styles.card, styles.disabledInfoCard]}>
-                <View style={styles.cardHeader}>
-                  <View style={styles.flexOne}>
-                    <Text style={styles.cardTitle}>Booking window</Text>
-                    <Text style={styles.metaLine}>Indian Rail booking opens {ADVANCE_DAYS} days before travel.</Text>
-                  </View>
-                  <Ionicons name="lock-closed-outline" size={20} color="#7b8794" />
-                </View>
-                <View style={styles.bookingWindowRow}>
-                  <View style={styles.bookingWindowItem}>
-                    <Text style={styles.bookingWindowLabel}>Allowed till</Text>
-                    <Text style={styles.bookingWindowDate}>{formatBookingDate(windowInfo.bookingEnd)}</Text>
-                  </View>
-                  {windowInfo.outsideWindow && (
-                    <View style={styles.bookingWindowItem}>
-                      <Text style={styles.bookingWindowLabel}>Next week opens</Text>
-                      <Text style={styles.bookingWindowDate}>{formatFriendlyBookingDate(windowInfo.nextOpenDate)}</Text>
-                      <Text style={styles.bookingWindowText}>for {formatBookingDate(windowInfo.outsideWindow)}</Text>
-                    </View>
-                  )}
-                </View>
-              </View>
-            )}
-          </>
-        )}
-      </Screen>
-    );
-  }
-
-  function NotificationsScreen() {
-    return (
-      <Screen>
-        <View style={styles.topBar}>
-          <View>
-            <Text style={styles.screenTitle}>Notifications</Text>
-            <Text style={styles.subtle}>{notifications.length} recent alert(s)</Text>
-          </View>
-          <TouchableOpacity style={styles.iconOnlyStrong} onPress={() => withBusy(async () => {
-            await clearAllNotifications();
-            await refresh();
-          })}>
-            <Ionicons name="trash-outline" size={20} color="#fff" />
-          </TouchableOpacity>
-        </View>
-
-        {!notifications.length ? (
-          <EmptyState title="No notifications" body="Availability alerts and captcha reminders will appear here." />
-        ) : notifications.map((notification) => (
-          <TouchableOpacity
-            key={notification.id}
-            style={[styles.card, !notification.is_read && styles.unreadCard]}
-            onPress={() => withBusy(() => handleNotificationPress(notification))}
-          >
-            <Text style={styles.primaryLine}>{notification.message}</Text>
-            <Text style={styles.metaLine}>{formatDateTime(notification.created_at)}</Text>
-            {isCaptchaNotification(notification) && <Pill label="Enter captcha" tone="warning" />}
-            {!notification.is_read && <Pill label="Unread" tone="warning" />}
-          </TouchableOpacity>
-        ))}
-      </Screen>
-    );
-  }
-
   if (!ready) {
     return (
       <View style={styles.loadingRoot}>
@@ -1567,7 +1528,7 @@ function TripPlannerApp() {
   return (
     <>
       <NavigationContainer ref={navigationRef}>
-        <StatusBar style="dark" />
+        <StatusBar style="dark" backgroundColor="#f6f8fb" translucent={false} />
         <Tab.Navigator
           screenOptions={({ route }) => ({
             headerShown: false,
@@ -1584,15 +1545,88 @@ function TripPlannerApp() {
               const icons = {
                 Trips: 'train-outline',
                 Calendar: 'calendar-outline',
-                Alerts: 'notifications-outline'
+                Alerts: 'notifications-outline',
+                About: 'information-circle-outline'
               };
               return <Ionicons name={icons[route.name]} size={size} color={color} />;
             }
           })}
         >
-          <Tab.Screen name="Trips" component={EventsScreen} />
-          <Tab.Screen name="Calendar" component={OccurrencesScreen} />
-          <Tab.Screen name="Alerts" component={NotificationsScreen} />
+          <Tab.Screen name="Trips">
+            {() => (
+              <TripsScreen
+                styles={styles}
+                Screen={Screen}
+                EmptyState={EmptyState}
+                Pill={Pill}
+                IconButton={IconButton}
+                sessionStatus={sessionStatus}
+                nativeNotificationsEnabled={nativeNotificationsEnabled}
+                busy={busy}
+                events={events}
+                selectedEventId={selectedEventId}
+                refresh={refresh}
+                withBusy={withBusy}
+                runAllEventChecks={runAllEventChecks}
+                runEventCheck={runEventCheck}
+                openEventCalendar={openEventCalendar}
+                setEditingEvent={setEditingEvent}
+                setFormVisible={setFormVisible}
+                eventRecurrenceLabel={eventRecurrenceLabel}
+                eventLastCheckedAt={eventLastCheckedAt}
+                nextCheckText={nextCheckText}
+              />
+            )}
+          </Tab.Screen>
+          <Tab.Screen name="Calendar">
+            {() => (
+              <CalendarScreen
+                styles={styles}
+                Screen={Screen}
+                EmptyState={EmptyState}
+                Pill={Pill}
+                IconButton={IconButton}
+                IrctcLinkButton={IrctcLinkButton}
+                selectedEvent={selectedEvent}
+                busy={busy}
+                refresh={refresh}
+                withBusy={withBusy}
+                runEventCheck={runEventCheck}
+                runOccurrenceCheck={runOccurrenceCheck}
+                openRailConnect={openRailConnect}
+                bookingWindowInfo={bookingWindowInfo}
+                occurrenceVisualState={occurrenceVisualState}
+                occurrenceVisualLabel={occurrenceVisualLabel}
+                calendarAvailabilityText={calendarAvailabilityText}
+                calendarAvailabilityValue={calendarAvailabilityValue}
+                formatBookingDate={formatBookingDate}
+                formatFriendlyBookingDate={formatFriendlyBookingDate}
+              />
+            )}
+          </Tab.Screen>
+          <Tab.Screen name="Alerts">
+            {() => (
+              <AlertsScreen
+                styles={styles}
+                Screen={Screen}
+                EmptyState={EmptyState}
+                Pill={Pill}
+                notifications={notifications}
+                refresh={refresh}
+                withBusy={withBusy}
+                handleNotificationPress={handleNotificationPress}
+                isCaptchaNotification={isCaptchaNotification}
+              />
+            )}
+          </Tab.Screen>
+          <Tab.Screen name="About">
+            {() => (
+              <AboutScreen
+                styles={styles}
+                Screen={Screen}
+              />
+            )}
+          </Tab.Screen>
         </Tab.Navigator>
       </NavigationContainer>
 
@@ -1600,10 +1634,7 @@ function TripPlannerApp() {
         visible={formVisible}
         editingEvent={editingEvent}
         onClose={() => setFormVisible(false)}
-        onSaved={async (id) => {
-          setSelectedEventId(id);
-          await refresh();
-        }}
+        onSaveTrip={saveEventFromForm}
       />
       <CaptchaModal
         visible={captchaVisible}
@@ -1612,12 +1643,26 @@ function TripPlannerApp() {
         loading={captchaLoading || busy}
         onChangeText={setCaptchaValue}
         onReload={reloadCaptcha}
-        onCancel={() => {
-          setCaptchaVisible(false);
-          setPendingCheck(null);
-        }}
+        onCancel={cancelCaptcha}
         onSubmit={submitCaptcha}
       />
+      {(loadingStatus || refreshing || autoChecking) && (
+        <View style={styles.loadingCard} pointerEvents="none">
+          <View style={styles.loadingCardSpinner}>
+            <ActivityIndicator size="small" color="#1d3557" />
+          </View>
+          <View style={styles.loadingCardTextBlock}>
+            <Text style={styles.loadingCardTitle}>
+              {loadingStatus?.title || (autoChecking ? 'Checking scheduled alerts' : 'Refreshing trips')}
+            </Text>
+            <Text style={styles.loadingCardDetail}>
+              {loadingStatus?.detail || (autoChecking
+                ? 'Seat availability checks are running one by one.'
+                : 'Updating trips, occurrences, and session status.')}
+            </Text>
+          </View>
+        </View>
+      )}
     </>
   );
 }
@@ -1625,15 +1670,23 @@ function TripPlannerApp() {
 function Screen({ children }) {
   const insets = useSafeAreaInsets();
   return (
-    <ScrollView
-      style={styles.screen}
-      contentContainerStyle={[
-        styles.screenContent,
-        { paddingBottom: 92 + Math.max(insets.bottom, 16) }
-      ]}
-    >
-      {children}
-    </ScrollView>
+    <View style={styles.screen}>
+      <ScrollView
+        style={styles.screenScroll}
+        contentContainerStyle={[
+          styles.screenContent,
+          {
+            paddingTop: Math.max(insets.top, 16) + 18,
+            paddingBottom: 16
+          }
+        ]}
+      >
+        {children}
+      </ScrollView>
+      <View style={styles.stickyAdFooter}>
+        <AdBanner placement="sticky" />
+      </View>
+    </View>
   );
 }
 
@@ -1655,9 +1708,68 @@ const styles = StyleSheet.create({
     gap: 12,
     backgroundColor: '#f6f8fb'
   },
+  loadingCard: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    bottom: 96,
+    minHeight: 72,
+    borderRadius: 8,
+    backgroundColor: '#fff',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderWidth: 1,
+    borderColor: '#d5dde8',
+    zIndex: 80,
+    elevation: 80,
+    shadowColor: '#172033',
+    shadowOpacity: 0.16,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 6 }
+  },
+  loadingCardSpinner: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: '#edf3f8',
+    alignItems: 'center',
+    justifyContent: 'center'
+  },
+  loadingCardTextBlock: {
+    flex: 1,
+    minWidth: 0
+  },
+  loadingCardTitle: {
+    color: '#172033',
+    fontSize: 14,
+    fontWeight: '900',
+    marginBottom: 3
+  },
+  loadingCardDetail: {
+    color: '#526175',
+    fontSize: 12,
+    lineHeight: 16
+  },
   screen: {
     flex: 1,
     backgroundColor: '#f6f8fb'
+  },
+  screenScroll: {
+    flex: 1,
+    backgroundColor: '#f6f8fb'
+  },
+  stickyAdFooter: {
+    backgroundColor: '#f6f8fb',
+    borderTopWidth: 1,
+    borderTopColor: '#e1e7ef',
+    paddingHorizontal: 16,
+    paddingTop: 8,
+    paddingBottom: 8,
+    zIndex: 20,
+    elevation: 20
   },
   screenContent: {
     padding: 16,
@@ -1784,6 +1896,31 @@ const styles = StyleSheet.create({
     color: '#526175',
     fontSize: 13,
     marginBottom: 4
+  },
+  infoText: {
+    color: '#526175',
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 8
+  },
+  linkRow: {
+    minHeight: 44,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#dbe3ee',
+    backgroundColor: '#f8fafc',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginTop: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9
+  },
+  linkRowText: {
+    color: '#1d3557',
+    fontSize: 14,
+    fontWeight: '800',
+    flexShrink: 1
   },
   availabilityRow: {
     flexDirection: 'row',
@@ -2015,6 +2152,15 @@ const styles = StyleSheet.create({
     minWidth: 0,
     marginBottom: 12
   },
+  autocompleteField: {
+    position: 'relative',
+    zIndex: 1,
+    elevation: 1
+  },
+  autocompleteFieldActive: {
+    zIndex: 1000,
+    elevation: 1000
+  },
   label: {
     color: '#31405a',
     fontWeight: '800',
@@ -2032,12 +2178,22 @@ const styles = StyleSheet.create({
     fontSize: 15
   },
   suggestionList: {
+    position: 'absolute',
+    top: 70,
+    left: 0,
+    right: 0,
+    zIndex: 1100,
+    elevation: 1100,
+    maxHeight: 230,
     borderWidth: 1,
     borderColor: '#dbe3ee',
     borderRadius: 8,
     backgroundColor: '#fff',
-    marginTop: 6,
-    overflow: 'hidden'
+    overflow: 'hidden',
+    shadowColor: '#172033',
+    shadowOpacity: 0.14,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 }
   },
   suggestionItem: {
     minHeight: 42,
@@ -2232,10 +2388,12 @@ const styles = StyleSheet.create({
   },
   twoCol: {
     flexDirection: 'row',
-    gap: 10
+    gap: 10,
+    zIndex: 1
   },
-  switchField: {
-    marginBottom: 16
+  twoColActive: {
+    zIndex: 900,
+    elevation: 900
   },
   switchRow: {
     flexDirection: 'row',
@@ -2243,11 +2401,34 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 4
   },
-  switchDescription: {
+  toggleSelection: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#ced7e4',
+    backgroundColor: '#fff',
+    padding: 12,
+    marginBottom: 12
+  },
+  toggleSelectionActive: {
+    backgroundColor: '#1d3557',
+    borderColor: '#1d3557'
+  },
+  toggleSelectionLabel: {
+    color: '#31405a',
+    fontWeight: '900',
+    fontSize: 14
+  },
+  toggleSelectionTextActive: {
+    color: '#fff'
+  },
+  toggleSelectionDescription: {
     color: '#60708a',
     fontSize: 12,
     lineHeight: 17,
     paddingRight: 44
+  },
+  toggleSelectionDescriptionActive: {
+    color: '#dce8f5'
   },
   captchaBackdrop: {
     flex: 1,

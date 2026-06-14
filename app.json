@@ -9,7 +9,7 @@
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "com.local.trainseatalert",
+      "bundleIdentifier": "com.sureshkumarkgm.trainseatalert",
       "infoPlist": {
         "UIBackgroundModes": [
           "fetch"
@@ -17,7 +17,8 @@
       }
     },
     "android": {
-      "package": "com.local.trainseatalert",
+      "package": "com.sureshkumarkgm.trainseatalert",
+      "versionCode": 1,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#1d3557"
@@ -25,10 +26,7 @@
       "permissions": [
         "RECEIVE_BOOT_COMPLETED",
         "WAKE_LOCK",
-        "SCHEDULE_EXACT_ALARM",
-        "POST_NOTIFICATIONS",
-        "android.permission.RECEIVE_BOOT_COMPLETED",
-        "android.permission.WAKE_LOCK"
+        "POST_NOTIFICATIONS"
       ]
     },
     "plugins": [
@@ -36,11 +34,18 @@
       "expo-notifications",
       "expo-background-fetch",
       "expo-task-manager",
-      "expo-font"
+      "expo-font",
+      [
+        "react-native-google-mobile-ads",
+        {
+          "androidAppId": "ca-app-pub-3678713750890640~8703922457"
+        }
+      ]
     ],
+    "owner": "sureshkgm",
     "extra": {
       "eas": {
-        "projectId": "f5061829-8269-42d3-8373-ae4d4f63ae72"
+        "projectId": "e32c476b-44db-4f31-a13b-9f8464b0f03c"
       }
     }
   }

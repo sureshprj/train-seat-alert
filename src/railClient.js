@@ -55,23 +55,29 @@ async function getCookieHeader() {
 
 async function persistSetCookies(setCookieHeader) {
   const setCookies = splitSetCookieHeader(setCookieHeader);
-  if (!setCookies.length) return;
+  if (!setCookies.length) return [];
 
   const cookieMap = await getCookieMap();
+  const persistedNames = [];
   for (const rawCookie of setCookies) {
     const [pair] = String(rawCookie).split(';');
     const separator = pair.indexOf('=');
     if (separator <= 0) continue;
     const name = pair.slice(0, separator).trim();
     const value = pair.slice(separator + 1).trim();
-    if (name) cookieMap[name] = value;
+    if (name) {
+      cookieMap[name] = value;
+      persistedNames.push(name);
+    }
   }
   await setSetting('rail_cookie_jar', JSON.stringify(cookieMap));
+  return persistedNames;
 }
 
 async function railRequest(config) {
   const cookieHeader = await getCookieHeader();
   const useStoredCookies = config.useStoredCookies !== false;
+
   const response = await axios({
     timeout: 20000,
     withCredentials: true,
@@ -83,7 +89,8 @@ async function railRequest(config) {
     }
   });
 
-  await persistSetCookies(response.headers?.['set-cookie'] || response.headers?.['Set-Cookie']);
+  const setCookieHeader = response.headers?.['set-cookie'] || response.headers?.['Set-Cookie'];
+  if (config.persistCookies !== false) await persistSetCookies(setCookieHeader);
   return response;
 }
 
@@ -134,6 +141,7 @@ async function fetchReferenceValues(type, options = {}) {
   const response = await railRequest({
     method: 'GET',
     url: `${BASE}/${endpoint}`,
+    persistCookies: false,
     headers: {
       Referer: `${BASE}/SEAT/SeatAvailability.html?locale=en`
     }
@@ -239,16 +247,20 @@ function resolveStationSelector(input, stations) {
 }
 
 async function buildAvailabilityParams(row, inputCaptcha) {
+  const referenceOptions = inputCaptcha ? { cacheOnly: true } : {};
   const [trains, stations] = await Promise.all([
-    fetchReferenceValues('trains'),
-    fetchReferenceValues('stations')
+    fetchReferenceValues('trains', referenceOptions),
+    fetchReferenceValues('stations', referenceOptions)
   ]);
+  const trainNo = resolveTrainSelector(row.train_no, trains);
+  const sourceStation = resolveStationSelector(row.source_station, stations);
+  const destinationStation = resolveStationSelector(row.destination_station, stations);
 
   const params = new URLSearchParams({
-    trainNo: resolveTrainSelector(row.train_no, trains),
+    trainNo,
     dt: toIndianRailDate(row.travel_date),
-    sourceStation: resolveStationSelector(row.source_station, stations),
-    destinationStation: resolveStationSelector(row.destination_station, stations),
+    sourceStation,
+    destinationStation,
     classc: row.class_code,
     quota: row.quota,
     inputPage: 'SEAT',
@@ -279,6 +291,7 @@ function responseIndicatesCaptchaOrSession(raw) {
 
 export async function requestAvailability(row, options = {}) {
   const session = await getSessionStatus();
+
   if (!options.inputCaptcha && !session.isActive) {
     return { captchaRequired: true };
   }
