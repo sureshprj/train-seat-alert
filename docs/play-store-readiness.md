@@ -15,13 +15,19 @@
 3. Complete Google Play Data Safety using the real production behavior.
 4. Complete Play Console app access, ads, content rating, target audience, and government apps declarations.
 5. Confirm AdMob app and ad unit are approved, and configure app-ads.txt if required for the publisher account.
-6. Build and test a production Android App Bundle:
+6. Build and test an Android APK on a real phone:
 
    ```sh
-   npx eas build --platform android --profile production
+   npm run build:android:preview
    ```
 
-7. Run closed testing if the Play developer account requires it.
+7. Build a production Android App Bundle for Play Console:
+
+   ```sh
+   npm run build:android:production
+   ```
+
+8. Run closed testing if the Play developer account requires it.
 
 ## Data Safety Draft Notes
 

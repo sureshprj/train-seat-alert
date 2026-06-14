@@ -1765,9 +1765,9 @@ const styles = StyleSheet.create({
     backgroundColor: '#f6f8fb',
     borderTopWidth: 1,
     borderTopColor: '#e1e7ef',
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 8,
+    paddingHorizontal: 8,
+    paddingTop: 4,
+    paddingBottom: 4,
     zIndex: 20,
     elevation: 20
   },

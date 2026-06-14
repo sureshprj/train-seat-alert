@@ -55,10 +55,26 @@ The Android app includes an in-app About screen with the unofficial-app disclaim
 
 Before submitting to production, replace the placeholder privacy URL and support email in `src/screens/AboutScreen.js`, publish `docs/privacy-policy.md` at that URL, and complete the Play Console checklist in `docs/play-store-readiness.md`.
 
-Build a production Android App Bundle with:
+Build an Android APK for phone testing with:
 
 ```sh
-npx eas build --platform android --profile production
+npm run build:android:preview
+```
+
+Preview APKs use AdMob test ads. Production builds use the configured production AdMob unit.
+
+To check real AdMob fill in an APK, build the explicit real-ad preview profile:
+
+```sh
+npm run build:android:preview-real-ads
+```
+
+Do not click real ads while testing.
+
+Build a production Android App Bundle for Play Console with:
+
+```sh
+npm run build:android:production
 ```
 
 Run unit tests with:

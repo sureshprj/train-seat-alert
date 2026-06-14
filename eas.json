@@ -12,6 +12,17 @@
       }
     },
     "preview": {
+      "env": {
+        "EXPO_PUBLIC_USE_ADMOB_TEST_ADS": "true"
+      },
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "preview-real-ads": {
+      "env": {
+        "EXPO_PUBLIC_USE_ADMOB_TEST_ADS": "false"
+      },
       "android": {
         "buildType": "apk"
       }
