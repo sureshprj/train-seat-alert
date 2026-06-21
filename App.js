@@ -27,6 +27,7 @@ import * as ExpoNotifications from 'expo-notifications';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import {
+  clearDeliveredCaptchaNotifications,
   configureNotifications
 } from './src/notifications';
 import {
@@ -52,19 +53,28 @@ import { checkEvent, checkOccurrence, validateTripAvailability } from './src/pla
 import {
   ADVANCE_DAYS,
   CLASS_OPTIONS,
+  DEFAULT_CHECK_TIMES,
   QUOTA_OPTIONS,
   RECURRENCE_OPTIONS,
+  TRIP_TYPE_OPTIONS,
   WEEKDAYS,
   formatAvailabilitySummary,
+  hasAnyRailDetails,
+  hasCompleteRailDetails,
   isAvailableStatus,
   isBelowThresholdStatus,
+  isHolidayTrip,
+  isSeatCheckTrip,
+  isSelectedDateTrip,
   isNotAvailableStatus,
-  normalizeCheckTimes,
   normalizeRecurrenceType,
   parseAvailableCount,
   normalizeEventPayload,
+  normalizeSelectedHolidayDates,
+  normalizeTripType,
   validateEventPayload
 } from './src/utils';
+import { INDIA_HOLIDAYS } from './src/holidays/indiaHolidays';
 import AdBanner from './src/AdBanner';
 import useCaptchaFlow from './src/hooks/useCaptchaFlow';
 import useForegroundCatchUp from './src/hooks/useForegroundCatchUp';
@@ -90,6 +100,7 @@ const AUTO_CAPTCHA_COOLDOWN_SETTING_PREFIX = 'auto_captcha_cooldown_until_';
 const MANUAL_CHECK_AUTO_PAUSE_MS = 3 * 60 * 1000;
 
 const blankForm = {
+  trip_type: 'regular',
   name: '',
   recurrence_type: 'weekly',
   start_date: new Date().toISOString().slice(0, 10),
@@ -100,9 +111,17 @@ const blankForm = {
   source_station: '',
   destination_station: '',
   threshold: '',
-  check_times: '08:00',
+  check_times: DEFAULT_CHECK_TIMES,
   booking_window_reminders: true,
-  is_active: true
+  is_active: true,
+  selected_dates: []
+};
+
+const DEFAULT_FORM_SECTION_EXPANDED = {
+  basics: true,
+  dates: true,
+  train: true,
+  reminders: true
 };
 
 function Pill({ label, tone = 'neutral' }) {
@@ -163,6 +182,41 @@ function Field({ label, value, onChangeText, keyboardType = 'default', autoCapit
           onFocus?.();
         }}
       />
+    </View>
+  );
+}
+
+function FormSectionHeader({ step, title, body, expanded = true, onToggle }) {
+  return (
+    <TouchableOpacity
+      style={[styles.formSectionHeader, !expanded && styles.formSectionHeaderCollapsed]}
+      onPress={onToggle}
+      activeOpacity={0.82}
+      disabled={!onToggle}
+      accessibilityRole={onToggle ? 'button' : undefined}
+      accessibilityLabel={`${expanded ? 'Collapse' : 'Expand'} ${title}`}
+    >
+      <Text style={styles.formSectionStep}>{step}</Text>
+      <View style={styles.flexOne}>
+        <Text style={styles.formSectionTitle}>{title}</Text>
+        <Text style={styles.formSectionBody}>{body}</Text>
+      </View>
+      {onToggle ? (
+        <Ionicons name={expanded ? 'chevron-up' : 'chevron-down'} size={20} color="#1d3557" />
+      ) : null}
+    </TouchableOpacity>
+  );
+}
+
+function FormSection({ step, title, body, children, active = false, expanded = true, onToggle }) {
+  return (
+    <View style={[styles.formSection, active && styles.formSectionActive]}>
+      <FormSectionHeader step={step} title={title} body={body} expanded={expanded} onToggle={onToggle} />
+      {expanded ? (
+        <View style={styles.formSectionContent}>
+          {children}
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -319,194 +373,358 @@ function recurrenceOptionLabel(value) {
 }
 
 function eventRecurrenceLabel(event) {
+  if (isSelectedDateTrip(event)) {
+    const count = event?.occurrences?.length || 0;
+    if (count === 1) return '1 selected date';
+    if (count > 1) return `${count} selected dates`;
+    return 'Selected dates';
+  }
   const recurrenceType = normalizeRecurrenceType(event?.recurrence_type);
   if (recurrenceType === 'weekly') return event?.weekday || 'Weekly';
   return recurrenceOptionLabel(recurrenceType);
 }
 
-function checkTimesFromValue(value) {
-  return normalizeCheckTimes(value)
-    .split(',')
-    .map((time) => time.trim())
-    .filter(Boolean);
+function eventTypeLabel(event) {
+  return TRIP_TYPE_OPTIONS.find((option) => option.value === normalizeTripType(event?.trip_type))?.label || 'Regular Trip';
 }
 
-function formatCheckTimeLabel(time) {
-  const match = /^(\d{2}):(\d{2})$/.exec(String(time || '').trim());
-  if (!match) return time;
-  return formatClock(Number(match[1]), Number(match[2]));
+function dateSelectionKey(item) {
+  return item.date;
 }
 
-function clampTimePart(value, max) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return 0;
-  return Math.max(0, Math.min(max, Math.floor(number)));
+function sortDateSelections(values) {
+  return normalizeSelectedHolidayDates(values);
 }
 
-function timeFromMinutes(minutes) {
-  const normalized = ((minutes % (24 * 60)) + (24 * 60)) % (24 * 60);
-  const hour = Math.floor(normalized / 60);
-  const minute = normalized % 60;
-  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+const CALENDAR_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function monthTitle(date) {
+  return date.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
 }
 
-function nextUnusedCheckTime(times) {
-  const existing = new Set(times);
-  const start = 8 * 60;
-  for (let offset = 0; offset < 24 * 60; offset += 60) {
-    const candidate = timeFromMinutes(start + offset);
-    if (!existing.has(candidate)) return candidate;
-  }
-  for (let offset = 30; offset < 24 * 60; offset += 30) {
-    const candidate = timeFromMinutes(start + offset);
-    if (!existing.has(candidate)) return candidate;
-  }
-  return '08:00';
+function shortHolidayName(value) {
+  return String(value || '').split(/[(/]/)[0].trim();
 }
 
-function CheckTimesPicker({ value, onChange }) {
-  const times = checkTimesFromValue(value);
-  const firstTime = times[0] || '08:00';
-  const [visible, setVisible] = useState(false);
-  const [hour, setHour] = useState(firstTime.slice(0, 2));
-  const [minute, setMinute] = useState(firstTime.slice(3, 5));
-  const [editingTime, setEditingTime] = useState('');
-  const selectedTime = `${String(clampTimePart(hour, 23)).padStart(2, '0')}:${String(clampTimePart(minute, 59)).padStart(2, '0')}`;
-  const duplicateTime = times.includes(selectedTime) && selectedTime !== editingTime;
+function addMonths(date, months) {
+  const next = new Date(date);
+  next.setMonth(next.getMonth() + months);
+  next.setHours(0, 0, 0, 0);
+  return next;
+}
 
-  function openPicker(seedTime, editing = false) {
-    const nextTime = seedTime || nextUnusedCheckTime(times);
-    setHour(nextTime.slice(0, 2));
-    setMinute(nextTime.slice(3, 5));
-    setEditingTime(editing && times.includes(nextTime) ? nextTime : '');
-    setVisible(true);
+function initialHolidayCalendarMonth(bookingWindowOnly) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const firstVisibleDate = bookingWindowOnly ? today : addDays(today, ADVANCE_DAYS + 1);
+  return new Date(firstVisibleDate.getFullYear(), firstVisibleDate.getMonth(), 1);
+}
+
+function HolidayDatePicker({
+  value,
+  onChange,
+  hasRailDetails = false,
+  bookingWindowOnly = false,
+  showHolidayBulkAction = true
+}) {
+  const [calendarMonth, setCalendarMonth] = useState(() => initialHolidayCalendarMonth(bookingWindowOnly));
+  const [holidaySearch, setHolidaySearch] = useState('');
+  const selectedDates = sortDateSelections(value);
+  const selectedSet = new Set(selectedDates.map(dateSelectionKey));
+  const todayIso = isoDateFromLocalDate(new Date());
+  const todayDate = localDateFromIso(todayIso);
+  const bookingEndDate = addDays(todayDate, ADVANCE_DAYS);
+  const bookingEndIso = isoDateFromLocalDate(bookingEndDate);
+  const holidayReminderOnly = !bookingWindowOnly;
+  const holidayEndDate = localDateFromIso(todayIso);
+  holidayEndDate.setFullYear(holidayEndDate.getFullYear() + 1);
+  const holidayEndIso = bookingWindowOnly
+    ? bookingEndIso
+    : isoDateFromLocalDate(addDays(holidayEndDate, -1));
+  const holidayStartIso = bookingWindowOnly ? todayIso : isoDateFromLocalDate(addDays(bookingEndDate, 1));
+  const bulkHolidayEndIso = isoDateFromLocalDate(addMonths(todayDate, 8));
+  const holidays = useMemo(() => (
+    INDIA_HOLIDAYS
+      .filter((holiday) => holiday.date >= holidayStartIso && holiday.date <= holidayEndIso)
+  ), [holidayEndIso, holidayStartIso]);
+  const holidayEveSelections = useMemo(() => (
+    holidays
+      .filter((holiday) => holiday.date <= bulkHolidayEndIso)
+      .map((holiday) => ({
+        date: isoDateFromLocalDate(addDays(localDateFromIso(holiday.date), -1)),
+        source_label: `Day before ${holiday.name}`
+      }))
+      .filter((item) => item.date >= holidayStartIso)
+  ), [bulkHolidayEndIso, holidayStartIso, holidays]);
+  const addableHolidayEveSelections = holidayEveSelections.filter((item) => !selectedSet.has(item.date));
+  useEffect(() => {
+    setCalendarMonth(initialHolidayCalendarMonth(bookingWindowOnly));
+  }, [bookingWindowOnly]);
+  const holidaysByDate = useMemo(() => {
+    const byDate = new Map();
+    holidays.forEach((holiday) => {
+      const current = byDate.get(holiday.date) || [];
+      current.push(holiday.name);
+      byDate.set(holiday.date, current);
+    });
+    return byDate;
+  }, [holidays]);
+  const calendarDays = useMemo(() => {
+    const firstOfMonth = new Date(calendarMonth.getFullYear(), calendarMonth.getMonth(), 1);
+    const firstGridDate = addDays(firstOfMonth, -firstOfMonth.getDay());
+    return Array.from({ length: 42 }, (_item, index) => addDays(firstGridDate, index));
+  }, [calendarMonth]);
+  const normalizedSearch = holidaySearch.trim().toLowerCase();
+  const filteredHolidays = useMemo(() => {
+    if (!normalizedSearch) return holidays;
+    return holidays.filter((holiday) => (
+      holiday.name.toLowerCase().includes(normalizedSearch)
+      || holiday.date.includes(normalizedSearch)
+      || formatBookingDate(localDateFromIso(holiday.date)).toLowerCase().includes(normalizedSearch)
+    ));
+  }, [holidays, normalizedSearch]);
+
+  function holidayContextForDate(date) {
+    const isoDate = isoDateFromLocalDate(date);
+    const sameDayHolidays = holidaysByDate.get(isoDate);
+    if (sameDayHolidays?.length) return sameDayHolidays.join(', ');
+
+    const nextDayHoliday = holidaysByDate.get(isoDateFromLocalDate(addDays(date, 1)));
+    if (nextDayHoliday?.length) return `Day before ${nextDayHoliday.join(', ')}`;
+
+    const previousDayHoliday = holidaysByDate.get(isoDateFromLocalDate(addDays(date, -1)));
+    if (previousDayHoliday?.length) return `Day after ${previousDayHoliday.join(', ')}`;
+
+    return 'Custom date';
   }
 
-  function setHourPart(nextHour) {
-    setHour(String(clampTimePart(nextHour, 23)).padStart(2, '0'));
+  function addSelection(date, sourceLabel) {
+    if (holidayReminderOnly && date <= bookingEndIso) return;
+    if (bookingWindowOnly && (date < todayIso || date > bookingEndIso)) return;
+    onChange(sortDateSelections([
+      ...selectedDates,
+      { date, source_label: sourceLabel }
+    ]));
   }
 
-  function setMinutePart(nextMinute) {
-    setMinute(String(clampTimePart(nextMinute, 59)).padStart(2, '0'));
+  function addHolidayEveDates() {
+    if (!showHolidayBulkAction || !addableHolidayEveSelections.length) return;
+    onChange(sortDateSelections([
+      ...selectedDates,
+      ...addableHolidayEveSelections
+    ]));
   }
 
-  function stepHour(delta) {
-    setHourPart((Number(hour) + delta + 24) % 24);
+  function clearAllDates() {
+    if (!selectedDates.length) return;
+    onChange([]);
   }
 
-  function stepMinute(delta) {
-    const next = Number(minute) + delta;
-    setMinutePart((next + 60) % 60);
+  function removeSelection(date) {
+    onChange(selectedDates.filter((item) => item.date !== date));
   }
 
-  function addTime() {
-    if (duplicateTime) return;
-
-    const nextTimes = editingTime
-      ? times.map((time) => (time === editingTime ? selectedTime : time))
-      : [...times, selectedTime];
-    onChange(normalizeCheckTimes(nextTimes));
-    setVisible(false);
+  function toggleSelection(date, sourceLabel) {
+    if (selectedSet.has(date)) {
+      removeSelection(date);
+    } else {
+      addSelection(date, sourceLabel);
+    }
   }
 
-  function removeTime(timeToRemove) {
-    const nextTimes = times.filter((time) => time !== timeToRemove);
-    onChange(nextTimes.length ? normalizeCheckTimes(nextTimes) : '');
+  function selectCalendarDate(date) {
+    const isoDate = isoDateFromLocalDate(date);
+    toggleSelection(isoDate, holidayContextForDate(date));
+  }
+
+  function shiftCalendarMonth(delta) {
+    setCalendarMonth((current) => new Date(current.getFullYear(), current.getMonth() + delta, 1));
+  }
+
+  function selectHolidaySearchResult(holiday) {
+    const holidayDate = localDateFromIso(holiday.date);
+    setCalendarMonth(new Date(holidayDate.getFullYear(), holidayDate.getMonth(), 1));
+    if (!selectedSet.has(holiday.date)) {
+      addSelection(holiday.date, holiday.name);
+    }
+    setHolidaySearch('');
+  }
+
+  function selectedDateStatusText(date) {
+    const travelDate = localDateFromIso(date);
+    if (travelDate < todayDate) return 'Travel date has passed.';
+    if (travelDate <= bookingEndDate) {
+      if (bookingWindowOnly) return 'Inside booking window. Seat checks can run after saving.';
+      return 'Inside booking window. Create a Seat Check Trip instead.';
+    }
+    return `Booking opens on ${formatBookingDate(addDays(travelDate, -ADVANCE_DAYS))}.`;
   }
 
   return (
-    <View style={styles.field}>
-      <Text style={styles.label}>Seat check times</Text>
-      <View style={styles.timeChipGrid}>
-        {times.map((time) => (
-          <Pressable key={time} style={styles.timeChip} onPress={() => openPicker(time, true)}>
-            <Ionicons name="time-outline" size={14} color="#1d3557" />
-            <Text style={styles.timeChipText}>{formatCheckTimeLabel(time)}</Text>
-            <Pressable
-              style={styles.timeChipRemove}
-              onPress={(event) => {
-                event?.stopPropagation?.();
-                removeTime(time);
-              }}
-            >
-              <Ionicons name="close" size={13} color="#526175" />
-            </Pressable>
-          </Pressable>
-        ))}
-        <Pressable style={styles.timeAddButton} onPress={() => openPicker()}>
-          <Ionicons name="add" size={16} color="#fff" />
-          <Text style={styles.timeAddButtonText}>Add time</Text>
-        </Pressable>
+    <View style={styles.holidayPicker}>
+      <View style={styles.holidayWindowSummary}>
+        <Ionicons name="calendar-outline" size={17} color="#1d3557" />
+        <View style={styles.flexOne}>
+          <Text style={styles.holidayWindowTitle}>
+            Current booking window
+          </Text>
+          <Text style={styles.holidayWindowText}>
+            {bookingWindowOnly
+              ? 'Choose travel dates that are currently open for booking.'
+              : 'Holiday reminders start after the current booking window. Use Seat Check Trip for open booking dates.'}
+          </Text>
+        </View>
       </View>
 
-      <Modal visible={visible} transparent animationType="fade">
-        <View style={styles.timePickerBackdrop}>
-          <View style={styles.timePickerPanel}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>{editingTime ? 'Edit Time' : 'Add Time'}</Text>
-              <TouchableOpacity onPress={() => setVisible(false)} style={styles.iconOnly}>
-                <Ionicons name="close" size={24} color="#1d3557" />
-              </TouchableOpacity>
-            </View>
-
-            <View style={styles.timePickerContent}>
-              <View style={styles.timeStepper}>
-                <TouchableOpacity style={styles.timeStepButton} onPress={() => stepHour(1)}>
-                  <Ionicons name="chevron-up" size={22} color="#1d3557" />
-                </TouchableOpacity>
-                <TextInput
-                  style={styles.timeInput}
-                  value={hour}
-                  onChangeText={setHourPart}
-                  keyboardType="number-pad"
-                  maxLength={2}
-                />
-                <TouchableOpacity style={styles.timeStepButton} onPress={() => stepHour(-1)}>
-                  <Ionicons name="chevron-down" size={22} color="#1d3557" />
-                </TouchableOpacity>
-                <Text style={styles.timePartLabel}>Hour</Text>
+      <Text style={styles.label}>Selected travel dates</Text>
+      {selectedDates.length ? (
+        <View style={styles.selectedDateGrid}>
+          {selectedDates.map((item) => (
+            <Pressable key={item.date} style={styles.selectedDateChip} onPress={() => removeSelection(item.date)}>
+              <View style={styles.flexOne}>
+                <Text style={styles.selectedDateText}>{formatBookingDate(localDateFromIso(item.date))}</Text>
+                {item.source_label && item.source_label !== 'Custom date' ? (
+                  <Text style={styles.selectedDateHolidayName}>{item.source_label}</Text>
+                ) : null}
+                <Text style={styles.selectedDateMeta}>{selectedDateStatusText(item.date)}</Text>
               </View>
-
-              <Text style={styles.timeSeparator}>:</Text>
-
-              <View style={styles.timeStepper}>
-                <TouchableOpacity style={styles.timeStepButton} onPress={() => stepMinute(5)}>
-                  <Ionicons name="chevron-up" size={22} color="#1d3557" />
-                </TouchableOpacity>
-                <TextInput
-                  style={styles.timeInput}
-                  value={minute}
-                  onChangeText={setMinutePart}
-                  keyboardType="number-pad"
-                  maxLength={2}
-                />
-                <TouchableOpacity style={styles.timeStepButton} onPress={() => stepMinute(-5)}>
-                  <Ionicons name="chevron-down" size={22} color="#1d3557" />
-                </TouchableOpacity>
-                <Text style={styles.timePartLabel}>Minute</Text>
-              </View>
-            </View>
-
-            <View style={styles.timePickerPreview}>
-              <Text style={styles.timePickerPreviewText}>
-                {formatCheckTimeLabel(selectedTime)}
-              </Text>
-              {duplicateTime && <Text style={styles.timePickerWarning}>Already added</Text>}
-            </View>
-
-            <View style={styles.captchaActions}>
-              <IconButton
-                icon="checkmark"
-                label={editingTime ? 'Update' : 'Add'}
-                compact
-                onPress={addTime}
-                disabled={duplicateTime}
-              />
-              <IconButton icon="close" label="Cancel" tone="secondary" compact onPress={() => setVisible(false)} />
-            </View>
-          </View>
+              <Ionicons name="close" size={15} color="#526175" />
+            </Pressable>
+          ))}
         </View>
-      </Modal>
+      ) : (
+        <Text style={styles.metaLine}>Choose dates from the calendar or search for a holiday.</Text>
+      )}
+
+      {showHolidayBulkAction ? (
+        <Pressable
+          style={[styles.holidayBulkButton, !addableHolidayEveSelections.length && styles.holidayBulkButtonDisabled]}
+          onPress={addHolidayEveDates}
+          disabled={!addableHolidayEveSelections.length}
+        >
+          <View style={styles.holidayBulkIcon}>
+            <Ionicons name="calendar-clear-outline" size={18} color="#fff" />
+          </View>
+          <View style={styles.flexOne}>
+            <Text style={styles.holidayBulkButtonText}>Add next 8 months holiday dates</Text>
+            <Text style={styles.holidayBulkHint}>
+              Adds the day before each holiday.
+            </Text>
+          </View>
+          <Ionicons name="add-circle" size={22} color="#1d3557" />
+        </Pressable>
+      ) : null}
+      {selectedDates.length ? (
+        <Pressable style={styles.holidayBulkClearButton} onPress={clearAllDates}>
+          <Ionicons name="trash-outline" size={16} color="#1d3557" />
+          <Text style={styles.holidayBulkClearText}>Clear all dates</Text>
+        </Pressable>
+      ) : null}
+
+      <Text style={styles.label}>Find holiday</Text>
+      <View style={styles.holidaySearchField}>
+        <Ionicons name="search" size={16} color="#60708a" />
+        <TextInput
+          style={styles.holidaySearchInput}
+          value={holidaySearch}
+          onChangeText={setHolidaySearch}
+          autoCapitalize="none"
+          placeholder="Search holiday name or date"
+          placeholderTextColor="#8a94a6"
+        />
+        {holidaySearch ? (
+          <TouchableOpacity style={styles.holidaySearchClear} onPress={() => setHolidaySearch('')}>
+            <Ionicons name="close" size={15} color="#526175" />
+          </TouchableOpacity>
+        ) : null}
+      </View>
+      {normalizedSearch ? (
+        <ScrollView
+          style={styles.holidaySearchResults}
+          contentContainerStyle={styles.holidaySearchResultsContent}
+          nestedScrollEnabled
+          keyboardShouldPersistTaps="handled"
+        >
+          {filteredHolidays.map((holiday) => {
+            const selected = selectedSet.has(holiday.date);
+            return (
+              <Pressable
+                key={`${holiday.date}-${holiday.name}`}
+                style={[styles.holidaySearchResult, selected && styles.holidaySearchResultSelected]}
+                onPress={() => selectHolidaySearchResult(holiday)}
+              >
+                <View style={styles.flexOne}>
+                  <Text style={[styles.holidaySearchResultName, selected && styles.weekdayTextSelected]} numberOfLines={1}>
+                    {holiday.name}
+                  </Text>
+                  <Text style={[styles.holidaySearchResultDate, selected && styles.weekdayTextSelected]}>
+                    {formatBookingDate(localDateFromIso(holiday.date))}
+                  </Text>
+                </View>
+                <Ionicons name="calendar-outline" size={17} color={selected ? '#fff' : '#1d3557'} />
+              </Pressable>
+            );
+          })}
+          {!filteredHolidays.length && (
+            <Text style={styles.holidayEmptyText}>No matching holidays in the next year.</Text>
+          )}
+        </ScrollView>
+      ) : null}
+
+      <View style={styles.calendarPicker}>
+        <View style={styles.calendarHeader}>
+          <TouchableOpacity style={styles.calendarNavButton} onPress={() => shiftCalendarMonth(-1)}>
+            <Ionicons name="chevron-back" size={18} color="#1d3557" />
+          </TouchableOpacity>
+          <Text style={styles.calendarMonthTitle}>{monthTitle(calendarMonth)}</Text>
+          <TouchableOpacity style={styles.calendarNavButton} onPress={() => shiftCalendarMonth(1)}>
+            <Ionicons name="chevron-forward" size={18} color="#1d3557" />
+          </TouchableOpacity>
+        </View>
+        <View style={styles.calendarWeekdayRow}>
+          {CALENDAR_WEEKDAYS.map((weekday) => (
+            <Text key={weekday} style={styles.calendarWeekday}>{weekday}</Text>
+          ))}
+        </View>
+        <View style={styles.calendarGrid}>
+          {calendarDays.map((date) => {
+            const isoDate = isoDateFromLocalDate(date);
+            const holidayNames = holidaysByDate.get(isoDate) || [];
+            const selected = selectedSet.has(isoDate);
+            const outsideMonth = date.getMonth() !== calendarMonth.getMonth();
+            const disabled = bookingWindowOnly
+              ? isoDate < todayIso || isoDate > bookingEndIso
+              : isoDate <= bookingEndIso;
+            return (
+              <Pressable
+                key={isoDate}
+                style={[
+                  styles.calendarDay,
+                  outsideMonth && styles.calendarDayOutside,
+                  holidayNames.length > 0 && styles.calendarDayHoliday,
+                  selected && styles.calendarDaySelected,
+                  disabled && styles.calendarDayDisabled
+                ]}
+                disabled={disabled}
+                onPress={() => selectCalendarDate(date)}
+              >
+                <Text style={[styles.calendarDayNumber, selected && styles.calendarDayTextSelected]}>
+                  {date.getDate()}
+                </Text>
+                {holidayNames.length > 0 && (
+                  <Text
+                    numberOfLines={1}
+                    adjustsFontSizeToFit
+                    style={[styles.calendarHolidayName, selected && styles.calendarDayTextSelected]}
+                  >
+                    {shortHolidayName(holidayNames[0])}
+                  </Text>
+                )}
+              </Pressable>
+            );
+          })}
+        </View>
+      </View>
     </View>
   );
 }
@@ -581,6 +799,8 @@ function formatClock(hour, minute) {
 
 function nextCheckText(event) {
   if (!event?.is_active) return 'Inactive';
+  if (isHolidayTrip(event)) return 'Booking reminders only';
+  if (!hasCompleteRailDetails(event)) return 'Train details incomplete';
 
   const times = String(event.check_times || '')
     .split(',')
@@ -634,6 +854,14 @@ function addDays(date, days) {
   next.setDate(next.getDate() + days);
   next.setHours(0, 0, 0, 0);
   return next;
+}
+
+function isoDateFromLocalDate(date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0')
+  ].join('-');
 }
 
 function nextTravelDateAfter(date, event) {
@@ -737,16 +965,35 @@ function irctcBookingDetails(event, occurrence) {
   ].join('\n');
 }
 
+function occurrenceBookingOpenText(occurrence) {
+  const openDate = addDays(localDateFromIso(occurrence.travel_date), -ADVANCE_DAYS);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return openDate <= today ? 'Booking open now' : `Booking opens ${formatFriendlyBookingDate(openDate)}`;
+}
+
+function selectedDatesInsideBookingWindow(selectedDates) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const bookingEnd = addDays(today, ADVANCE_DAYS);
+
+  return sortDateSelections(selectedDates).filter((item) => {
+    const travelDate = localDateFromIso(item.date);
+    return travelDate >= today && travelDate <= bookingEnd;
+  });
+}
+
 function isCaptchaNotification(notification) {
   return /captcha required/i.test(notification?.message || '');
 }
 
-function EventFormModal({ visible, editingEvent, onClose, onSaveTrip }) {
+function EventFormModal({ visible, editingEvent, draftEvent, onClose, onSaveTrip }) {
   const insets = useSafeAreaInsets();
   const [form, setForm] = useState(blankForm);
   const [saving, setSaving] = useState(false);
   const [formTouched, setFormTouched] = useState(false);
   const [activeAutocompleteId, setActiveAutocompleteId] = useState(null);
+  const [formSectionsExpanded, setFormSectionsExpanded] = useState(DEFAULT_FORM_SECTION_EXPANDED);
   const formValidationMessage = useMemo(() => {
     try {
       return validateEventPayload(normalizeEventPayload({ ...form, is_active: form.is_active }));
@@ -761,7 +1008,13 @@ function EventFormModal({ visible, editingEvent, onClose, onSaveTrip }) {
     if (!visible) return;
     setFormTouched(false);
     setActiveAutocompleteId(null);
+    setFormSectionsExpanded({ ...DEFAULT_FORM_SECTION_EXPANDED });
+    const editingSelectedDates = normalizeSelectedHolidayDates((editingEvent?.occurrences || []).map((occurrence) => ({
+      date: occurrence.travel_date,
+      source_label: occurrence.source_label || editingEvent?.holiday_name || 'Custom date'
+    })));
     setForm(editingEvent ? {
+      trip_type: normalizeTripType(editingEvent.trip_type),
       name: editingEvent.name,
       recurrence_type: normalizeRecurrenceType(editingEvent.recurrence_type),
       start_date: editingEvent.start_date || new Date().toISOString().slice(0, 10),
@@ -772,15 +1025,63 @@ function EventFormModal({ visible, editingEvent, onClose, onSaveTrip }) {
       source_station: editingEvent.source_station,
       destination_station: editingEvent.destination_station,
       threshold: String(editingEvent.threshold),
-      check_times: editingEvent.check_times || '08:00',
+      check_times: editingEvent.check_times || DEFAULT_CHECK_TIMES,
       booking_window_reminders: Boolean(editingEvent.booking_window_reminders),
-      is_active: Boolean(editingEvent.is_active)
-    } : blankForm);
-  }, [editingEvent, visible]);
+      is_active: Boolean(editingEvent.is_active),
+      selected_dates: editingSelectedDates
+    } : {
+      ...blankForm,
+      ...(draftEvent || {})
+    });
+  }, [draftEvent, editingEvent, visible]);
 
   function setField(key, value) {
     setFormTouched(true);
-    setForm((current) => ({ ...current, [key]: value }));
+    setForm((current) => {
+      if (key === 'trip_type' && value === 'holiday' && current.trip_type !== 'holiday') {
+        return {
+          ...current,
+          trip_type: 'holiday',
+          recurrence_type: 'weekly',
+          weekday: '',
+          train_no: '',
+          class_code: '',
+          quota: '',
+          source_station: '',
+          destination_station: '',
+          threshold: '',
+          check_times: DEFAULT_CHECK_TIMES,
+          is_active: true
+        };
+      }
+      if (key === 'trip_type' && value === 'seat_check' && current.trip_type !== 'seat_check') {
+        return {
+          ...current,
+          trip_type: 'seat_check',
+          recurrence_type: 'weekly',
+          weekday: '',
+          booking_window_reminders: false,
+          check_times: current.check_times || DEFAULT_CHECK_TIMES,
+          selected_dates: current.selected_dates || [],
+          is_active: true
+        };
+      }
+      if (key === 'trip_type' && value === 'regular' && current.trip_type !== 'regular') {
+        return {
+          ...current,
+          trip_type: 'regular',
+          recurrence_type: 'weekly',
+          weekday: 'Tuesday',
+          train_no: current.train_no || '',
+          class_code: current.class_code || 'SL',
+          quota: current.quota || 'GN',
+          threshold: current.threshold || '',
+          check_times: current.check_times || DEFAULT_CHECK_TIMES,
+          selected_dates: []
+        };
+      }
+      return { ...current, [key]: value };
+    });
   }
 
   function dismissAutocomplete(expectedId) {
@@ -794,6 +1095,14 @@ function EventFormModal({ visible, editingEvent, onClose, onSaveTrip }) {
     return ids.includes(activeAutocompleteId);
   }
 
+  function toggleFormSection(section) {
+    dismissAutocomplete();
+    setFormSectionsExpanded((current) => ({
+      ...current,
+      [section]: !current[section]
+    }));
+  }
+
   async function save() {
     try {
       setSaving(true);
@@ -801,6 +1110,21 @@ function EventFormModal({ visible, editingEvent, onClose, onSaveTrip }) {
         ...form,
         is_active: form.is_active
       };
+      if (body.trip_type === 'holiday') {
+        Object.assign(body, {
+          train_no: '',
+          class_code: '',
+          quota: '',
+          source_station: '',
+          destination_station: '',
+          threshold: '',
+          check_times: DEFAULT_CHECK_TIMES,
+          is_active: true
+        });
+      }
+      if (body.trip_type === 'seat_check') {
+        body.booking_window_reminders = false;
+      }
       const payload = normalizeEventPayload(body);
       const validationError = validateEventPayload(payload);
       if (validationError) throw new Error(validationError);
@@ -812,6 +1136,110 @@ function EventFormModal({ visible, editingEvent, onClose, onSaveTrip }) {
     } finally {
       setSaving(false);
     }
+  }
+
+  const holidayTrip = form.trip_type === 'holiday';
+  const seatCheckTrip = form.trip_type === 'seat_check';
+  const selectedDateTrip = holidayTrip || seatCheckTrip;
+  const normalizedForm = normalizeEventPayload({ ...form, is_active: form.is_active });
+  const hasRailDetails = hasCompleteRailDetails(normalizedForm);
+  const railDetailsExpected = !holidayTrip;
+  const hasPartialRailDetails = railDetailsExpected && hasAnyRailDetails(normalizedForm) && !hasRailDetails;
+  const bookingOpenHolidayDates = selectedDateTrip
+    ? selectedDatesInsideBookingWindow(normalizedForm.selected_dates)
+    : [];
+  function renderRailFields({ optional = false } = {}) {
+    return (
+      <>
+        <AutocompleteField
+          id="train_no"
+          label={optional ? 'Train (optional)' : 'Train'}
+          value={form.train_no}
+          onChangeText={(value) => setField('train_no', value)}
+          onSelect={(item) => setField('train_no', item.value)}
+          searchSuggestions={searchTrainSuggestions}
+          autoCapitalize="characters"
+          placeholder="Train no or name"
+          activeId={activeAutocompleteId}
+          onActivate={setActiveAutocompleteId}
+          onDismiss={dismissAutocomplete}
+        />
+
+        <View style={[styles.twoCol, rowHasActiveAutocomplete(['class_code', 'quota']) && styles.twoColActive]}>
+          <AutocompleteField
+            id="class_code"
+            label={optional ? 'Class (optional)' : 'Class'}
+            value={form.class_code}
+            onChangeText={(value) => setField('class_code', value)}
+            onSelect={(item) => setField('class_code', item.value)}
+            searchSuggestions={searchClassSuggestions}
+            minQueryLength={0}
+            autoCapitalize="characters"
+            placeholder="SL, 3A, AC..."
+            activeId={activeAutocompleteId}
+            onActivate={setActiveAutocompleteId}
+            onDismiss={dismissAutocomplete}
+          />
+          <AutocompleteField
+            id="quota"
+            label={optional ? 'Quota (optional)' : 'Quota'}
+            value={form.quota}
+            onChangeText={(value) => setField('quota', value)}
+            onSelect={(item) => setField('quota', item.value)}
+            searchSuggestions={searchQuotaSuggestions}
+            minQueryLength={0}
+            autoCapitalize="characters"
+            placeholder="GN, Tatkal..."
+            activeId={activeAutocompleteId}
+            onActivate={setActiveAutocompleteId}
+            onDismiss={dismissAutocomplete}
+          />
+        </View>
+        <View style={[styles.twoCol, rowHasActiveAutocomplete(['source_station', 'destination_station']) && styles.twoColActive]}>
+          <AutocompleteField
+            id="source_station"
+            label={optional ? 'From station (optional)' : 'From station'}
+            value={form.source_station}
+            onChangeText={(value) => setField('source_station', value)}
+            onSelect={(item) => setField('source_station', item.value)}
+            searchSuggestions={searchStationSuggestions}
+            autoCapitalize="characters"
+            placeholder="Code or name"
+            activeId={activeAutocompleteId}
+            onActivate={setActiveAutocompleteId}
+            onDismiss={dismissAutocomplete}
+          />
+          <AutocompleteField
+            id="destination_station"
+            label={optional ? 'To station (optional)' : 'To station'}
+            value={form.destination_station}
+            onChangeText={(value) => setField('destination_station', value)}
+            onSelect={(item) => setField('destination_station', item.value)}
+            searchSuggestions={searchStationSuggestions}
+            autoCapitalize="characters"
+            placeholder="Code or name"
+            activeId={activeAutocompleteId}
+            onActivate={setActiveAutocompleteId}
+            onDismiss={dismissAutocomplete}
+          />
+        </View>
+        <Field
+          label="Alert when seats are below"
+          value={form.threshold}
+          onChangeText={(value) => setField('threshold', value)}
+          keyboardType="number-pad"
+          onFocus={dismissAutocomplete}
+        />
+        <ToggleSelection
+          label="Seat alerts"
+          value={form.is_active}
+          onValueChange={(value) => setField('is_active', value)}
+          description={optional && !hasRailDetails
+            ? 'Seat checks start after train details are added.'
+            : 'Checks seat availability automatically and sends alerts when seats match your alert rule.'}
+        />
+      </>
+    );
   }
 
   return (
@@ -831,160 +1259,159 @@ function EventFormModal({ visible, editingEvent, onClose, onSaveTrip }) {
           ]}
           keyboardShouldPersistTaps="handled"
         >
-          <Field
-            label="Trip name"
-            value={form.name}
-            onChangeText={(value) => setField('name', value)}
-            autoCapitalize="words"
-            onFocus={dismissAutocomplete}
-          />
-
-          <Text style={styles.label}>Travel frequency</Text>
-          <View style={styles.recurrenceGrid}>
-            {RECURRENCE_OPTIONS.map((option) => (
-              <Pressable
-                key={option.value}
-                onPress={() => {
-                  dismissAutocomplete();
-                  setField('recurrence_type', option.value);
-                }}
-                style={[styles.recurrenceChip, form.recurrence_type === option.value && styles.weekdayChipSelected]}
-              >
-                <Text style={[styles.weekdayText, form.recurrence_type === option.value && styles.weekdayTextSelected]}>
-                  {option.label}
-                </Text>
-              </Pressable>
-            ))}
-          </View>
-
-          {form.recurrence_type === 'weekly' ? (
-            <>
-              <Text style={styles.label}>Travel weekday</Text>
-              <View style={styles.weekdayGrid}>
-                {WEEKDAYS.map((weekday) => (
-                  <Pressable
-                    key={weekday}
-                    onPress={() => {
-                      dismissAutocomplete();
-                      setField('weekday', weekday);
-                    }}
-                    style={[styles.weekdayChip, form.weekday === weekday && styles.weekdayChipSelected]}
-                  >
-                    <Text style={[styles.weekdayText, form.weekday === weekday && styles.weekdayTextSelected]}>
-                      {weekday.slice(0, 3)}
-                    </Text>
-                  </Pressable>
-                ))}
-              </View>
-            </>
-          ) : (
+          <FormSection
+            step="1"
+            title="Trip basics"
+            body="Name this plan and choose the trip type."
+            expanded={formSectionsExpanded.basics}
+            onToggle={() => toggleFormSection('basics')}
+          >
             <Field
-              label="Start date"
-              value={form.start_date}
-              onChangeText={(value) => setField('start_date', value)}
-              autoCapitalize="none"
-              placeholder="YYYY-MM-DD"
+              label="Trip name"
+              value={form.name}
+              onChangeText={(value) => setField('name', value)}
+              autoCapitalize="words"
               onFocus={dismissAutocomplete}
             />
-          )}
 
-          <AutocompleteField
-            id="train_no"
-            label="Train"
-            value={form.train_no}
-            onChangeText={(value) => setField('train_no', value)}
-            onSelect={(item) => setField('train_no', item.value)}
-            searchSuggestions={searchTrainSuggestions}
-            autoCapitalize="characters"
-            placeholder="Train no or name"
-            activeId={activeAutocompleteId}
-            onActivate={setActiveAutocompleteId}
-            onDismiss={dismissAutocomplete}
-          />
+            <Text style={styles.label}>Trip type</Text>
+            <View style={styles.recurrenceGrid}>
+              {TRIP_TYPE_OPTIONS.map((option) => (
+                <Pressable
+                  key={option.value}
+                  onPress={() => {
+                    dismissAutocomplete();
+                    setField('trip_type', option.value);
+                  }}
+                  style={[styles.recurrenceChip, form.trip_type === option.value && styles.weekdayChipSelected]}
+                >
+                  <Text style={[styles.weekdayText, form.trip_type === option.value && styles.weekdayTextSelected]}>
+                    {option.label}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </FormSection>
 
-          <View style={[styles.twoCol, rowHasActiveAutocomplete(['class_code', 'quota']) && styles.twoColActive]}>
-            <AutocompleteField
-              id="class_code"
-              label="Class"
-              value={form.class_code}
-              onChangeText={(value) => setField('class_code', value)}
-              onSelect={(item) => setField('class_code', item.value)}
-              searchSuggestions={searchClassSuggestions}
-              minQueryLength={0}
-              autoCapitalize="characters"
-              placeholder="SL, 3A, AC..."
-              activeId={activeAutocompleteId}
-              onActivate={setActiveAutocompleteId}
-              onDismiss={dismissAutocomplete}
-            />
-            <AutocompleteField
-              id="quota"
-              label="Quota"
-              value={form.quota}
-              onChangeText={(value) => setField('quota', value)}
-              onSelect={(item) => setField('quota', item.value)}
-              searchSuggestions={searchQuotaSuggestions}
-              minQueryLength={0}
-              autoCapitalize="characters"
-              placeholder="GN, Tatkal..."
-              activeId={activeAutocompleteId}
-              onActivate={setActiveAutocompleteId}
-              onDismiss={dismissAutocomplete}
-            />
-          </View>
-          <View style={[styles.twoCol, rowHasActiveAutocomplete(['source_station', 'destination_station']) && styles.twoColActive]}>
-            <AutocompleteField
-              id="source_station"
-              label="From station"
-              value={form.source_station}
-              onChangeText={(value) => setField('source_station', value)}
-              onSelect={(item) => setField('source_station', item.value)}
-              searchSuggestions={searchStationSuggestions}
-              autoCapitalize="characters"
-              placeholder="Code or name"
-              activeId={activeAutocompleteId}
-              onActivate={setActiveAutocompleteId}
-              onDismiss={dismissAutocomplete}
-            />
-            <AutocompleteField
-              id="destination_station"
-              label="To station"
-              value={form.destination_station}
-              onChangeText={(value) => setField('destination_station', value)}
-              onSelect={(item) => setField('destination_station', item.value)}
-              searchSuggestions={searchStationSuggestions}
-              autoCapitalize="characters"
-              placeholder="Code or name"
-              activeId={activeAutocompleteId}
-              onActivate={setActiveAutocompleteId}
-              onDismiss={dismissAutocomplete}
-            />
-          </View>
-          <Field
-            label="Alert when seats are ≤"
-            value={form.threshold}
-            onChangeText={(value) => setField('threshold', value)}
-            keyboardType="number-pad"
-            onFocus={dismissAutocomplete}
-          />
-          <CheckTimesPicker value={form.check_times} onChange={(value) => setField('check_times', value)} />
-          <ToggleSelection
-            label="Seat alerts"
-            value={form.is_active}
-            onValueChange={(value) => setField('is_active', value)}
-            description="Checks seat availability at your selected times and sends alerts when seats match your alert rule."
-          />
-          <ToggleSelection
-            label="Booking window reminders"
-            value={form.booking_window_reminders}
-            onValueChange={(value) => setField('booking_window_reminders', value)}
-            description="Sends reminders 2 days and 1 day before booking opens for this trip."
-          />
+          <FormSection
+            step="2"
+            title={selectedDateTrip ? 'Travel dates' : 'Travel pattern'}
+            body={holidayTrip
+              ? 'Save holiday dates for booking-window reminders.'
+              : seatCheckTrip
+                ? 'Choose one or more dates inside the current booking window.'
+                : 'We will generate upcoming travel dates from this pattern.'}
+            expanded={formSectionsExpanded.dates}
+            onToggle={() => toggleFormSection('dates')}
+          >
+            {selectedDateTrip ? (
+              <HolidayDatePicker
+                value={form.selected_dates}
+                onChange={(value) => setField('selected_dates', value)}
+                hasRailDetails={hasRailDetails}
+                bookingWindowOnly={seatCheckTrip}
+                showHolidayBulkAction={holidayTrip}
+              />
+            ) : (
+              <>
+                <Text style={styles.label}>Travel frequency</Text>
+                <View style={styles.recurrenceGrid}>
+                  {RECURRENCE_OPTIONS.map((option) => (
+                    <Pressable
+                      key={option.value}
+                      onPress={() => {
+                        dismissAutocomplete();
+                        setField('recurrence_type', option.value);
+                      }}
+                      style={[styles.recurrenceChip, form.recurrence_type === option.value && styles.weekdayChipSelected]}
+                    >
+                      <Text style={[styles.weekdayText, form.recurrence_type === option.value && styles.weekdayTextSelected]}>
+                        {option.label}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
 
-          {showValidationMessage ? (
-            <Text style={styles.formValidationText}>{formValidationMessage}</Text>
+                {form.recurrence_type === 'weekly' ? (
+                  <>
+                    <Text style={styles.label}>Travel weekday</Text>
+                    <View style={styles.weekdayGrid}>
+                      {WEEKDAYS.map((weekday) => (
+                        <Pressable
+                          key={weekday}
+                          onPress={() => {
+                            dismissAutocomplete();
+                            setField('weekday', weekday);
+                          }}
+                          style={[styles.weekdayChip, form.weekday === weekday && styles.weekdayChipSelected]}
+                        >
+                          <Text style={[styles.weekdayText, form.weekday === weekday && styles.weekdayTextSelected]}>
+                            {weekday.slice(0, 3)}
+                          </Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                  </>
+                ) : (
+                  <Field
+                    label="Start date"
+                    value={form.start_date}
+                    onChangeText={(value) => setField('start_date', value)}
+                    autoCapitalize="none"
+                    placeholder="YYYY-MM-DD"
+                    onFocus={dismissAutocomplete}
+                  />
+                )}
+              </>
+            )}
+          </FormSection>
+
+          {!holidayTrip ? (
+            <FormSection
+              step="3"
+              title="Train details & seat alerts"
+              body={seatCheckTrip
+                ? 'Use one train setup to check every selected date.'
+                : 'Add train details so automatic seat checks can run.'}
+              active={rowHasActiveAutocomplete(['train_no', 'class_code', 'quota', 'source_station', 'destination_station'])}
+              expanded={formSectionsExpanded.train}
+              onToggle={() => toggleFormSection('train')}
+            >
+              {seatCheckTrip ? (
+                <Text style={styles.trainSectionNote}>
+                  Seat checks will run only for the selected dates inside the booking window.
+                </Text>
+              ) : null}
+              {renderRailFields()}
+            </FormSection>
           ) : null}
-          <IconButton icon="save-outline" label={saving ? 'Saving...' : 'Save trip'} onPress={save} disabled={!canSave} />
+
+          {!seatCheckTrip ? (
+            <FormSection
+              step={holidayTrip ? '3' : '4'}
+              title="Reminders"
+              body="Get notified before railway booking opens for upcoming travel dates."
+              expanded={formSectionsExpanded.reminders}
+              onToggle={() => toggleFormSection('reminders')}
+            >
+              <ToggleSelection
+                label="Booking window reminders"
+                value={form.booking_window_reminders}
+                onValueChange={(value) => setField('booking_window_reminders', value)}
+                description="Sends reminders 2 days and 1 day before booking opens for this trip."
+              />
+            </FormSection>
+          ) : null}
+
+          <View style={styles.formActionFooter}>
+            {showValidationMessage ? (
+              <Text style={styles.formValidationText}>{formValidationMessage}</Text>
+            ) : null}
+            {holidayTrip && hasPartialRailDetails && !showValidationMessage ? (
+              <Text style={styles.formValidationText}>Complete train details to enable seat checks, or clear the partial fields.</Text>
+            ) : null}
+            <IconButton icon="save-outline" label={saving ? 'Saving...' : 'Save trip'} onPress={save} disabled={!canSave} />
+          </View>
         </ScrollView>
       </KeyboardAvoidingView>
     </Modal>
@@ -1048,6 +1475,7 @@ function TripPlannerApp() {
   const [sessionStatus, setSessionStatus] = useState({ isActive: false });
   const [formVisible, setFormVisible] = useState(false);
   const [editingEvent, setEditingEvent] = useState(null);
+  const [draftEvent, setDraftEvent] = useState(null);
   const [busy, setBusy] = useState(false);
   const [loadingStatus, setLoadingStatus] = useState(null);
   const [nativeNotificationsEnabled, setNativeNotificationsEnabled] = useState(null);
@@ -1245,12 +1673,17 @@ function TripPlannerApp() {
   }
 
   async function runEventCheck(event, inputCaptcha = '', deepCheck = true) {
+    if (!hasCompleteRailDetails(event)) {
+      Alert.alert('Train details needed', 'Add train, class, quota, and station details before checking seat availability.');
+      return { skipped: true };
+    }
     const result = await checkEvent(event.id, { inputCaptcha, suppressNotifications: false, deepCheck });
     if (result.captchaRequired) {
       await openCaptcha({ type: 'event', eventId: event.id, suppressNotifications: false });
       return result;
     }
     pauseAutoChecksAfterManualCheck();
+    await clearDeliveredCaptchaNotifications(event.id);
     await refresh();
     Alert.alert('Check complete', `${result.checked || 0} occurrence(s) checked.`);
     return result;
@@ -1279,6 +1712,7 @@ function TripPlannerApp() {
 
       checked += result.checked || 0;
       checkedEvents += 1;
+      await clearDeliveredCaptchaNotifications(event.id);
     }
 
     pauseAutoChecksAfterManualCheck();
@@ -1288,9 +1722,9 @@ function TripPlannerApp() {
   }
 
   async function runAllEventChecks() {
-    const activeEvents = events.filter((event) => event.is_active);
+    const activeEvents = events.filter((event) => event.is_active && hasCompleteRailDetails(event));
     if (!activeEvents.length) {
-      Alert.alert('No active trips', 'Create or enable a trip before checking alerts.');
+      Alert.alert('No trips ready to check', 'Create or enable a trip with complete train details before checking alerts.');
       return;
     }
 
@@ -1298,12 +1732,17 @@ function TripPlannerApp() {
   }
 
   async function runOccurrenceCheck(event, occurrence, inputCaptcha = '') {
+    if (!hasCompleteRailDetails(event)) {
+      Alert.alert('Train details needed', 'Add train, class, quota, and station details before checking seat availability.');
+      return { skipped: true };
+    }
     const result = await checkOccurrence(buildOccurrenceRow(event, occurrence), { inputCaptcha, force: true });
     if (result.captchaRequired) {
       await openCaptcha({ type: 'occurrence', eventId: event.id, occurrenceId: occurrence.id });
       return result;
     }
     pauseAutoChecksAfterManualCheck();
+    await clearDeliveredCaptchaNotifications(event.id);
     await refresh();
     Alert.alert('Check complete', result.availabilitySummary || result.availabilityStatus || 'No availability status returned');
     return result;
@@ -1313,19 +1752,23 @@ function TripPlannerApp() {
     const payload = normalizeEventPayload(body);
     const validationError = validateEventPayload(payload);
     if (validationError) throw new Error(validationError);
+    const holidayTrip = isHolidayTrip(payload);
+    const shouldValidateRail = hasCompleteRailDetails(payload) && !holidayTrip;
 
-    const railValidation = await validateTripAvailability(payload, { inputCaptcha });
-    if (railValidation.captchaRequired) {
-      if (inputCaptcha) throw new Error('Captcha was not accepted. Try again.');
-      await openCaptcha({
-        type: 'save-event',
-        body,
-        editingEventId
-      });
-      return { pendingCaptcha: true };
-    }
-    if (!railValidation.valid) {
-      throw new Error(`Indian Rail validation failed: ${railValidation.message}`);
+    if (shouldValidateRail) {
+      const railValidation = await validateTripAvailability(payload, { inputCaptcha });
+      if (railValidation.captchaRequired) {
+        if (inputCaptcha) throw new Error('Captcha was not accepted. Try again.');
+        await openCaptcha({
+          type: 'save-event',
+          body,
+          editingEventId
+        });
+        return { pendingCaptcha: true };
+      }
+      if (!railValidation.valid) {
+        throw new Error(`Indian Rail validation failed: ${railValidation.message}`);
+      }
     }
 
     const saved = editingEventId
@@ -1333,23 +1776,63 @@ function TripPlannerApp() {
       : await createEvent(body);
     setSelectedEventId(saved.id);
 
-    const immediateCheck = await checkEvent(saved.id, {
-      inputCaptcha,
-      suppressNotifications: false,
-      deepCheck: true
-    });
-
     await refresh();
     setFormVisible(false);
-    if (immediateCheck.captchaRequired) {
-      await openCaptcha({
-        type: 'event',
-        eventId: saved.id,
-        suppressNotifications: false
+    if (shouldValidateRail) {
+      const immediateCheck = await checkEvent(saved.id, {
+        inputCaptcha,
+        suppressNotifications: false,
+        deepCheck: true
       });
-      return { saved, pendingCaptcha: true };
+      if (immediateCheck.captchaRequired) {
+        await openCaptcha({
+          type: 'event',
+          eventId: saved.id,
+          suppressNotifications: false
+        });
+        return { saved, pendingCaptcha: true };
+      }
+      await refresh();
     }
     return { saved };
+  }
+
+  async function runAutomatedEventRuns(eventRuns = []) {
+    let checked = 0;
+
+    for (let index = 0; index < eventRuns.length; index += 1) {
+      const eventRun = eventRuns[index];
+      const event = events.find((item) => item.id === eventRun.eventId);
+      if (!event) continue;
+
+      const result = await checkEvent(event.id, {
+        automated: true,
+        suppressNotifications: false,
+        deepCheck: true
+      });
+
+      if (result.captchaRequired) {
+        await refresh();
+        await openCaptcha({
+          type: 'event',
+          eventId: event.id,
+          suppressNotifications: false,
+          automated: true,
+          runDate: eventRun.runDate,
+          scheduledTimes: eventRun.scheduledTimes || [],
+          automatedEventRuns: eventRuns.slice(index + 1)
+        });
+        return { paused: true, checked };
+      }
+
+      if (eventRun.runDate && eventRun.scheduledTimes?.length) {
+        await recordRuns(event.id, eventRun.runDate, eventRun.scheduledTimes);
+      }
+      await clearDeliveredCaptchaNotifications(event.id);
+      checked += result.checked || 0;
+    }
+
+    return { paused: false, checked };
   }
 
   async function submitCaptcha() {
@@ -1391,7 +1874,16 @@ function TripPlannerApp() {
         if (pendingCheck.automated && pendingCheck.runDate && pendingCheck.scheduledTimes?.length) {
           await recordRuns(event.id, pendingCheck.runDate, pendingCheck.scheduledTimes);
         }
+        await clearDeliveredCaptchaNotifications(event.id);
         pauseAutoChecksAfterManualCheck();
+        if (pendingCheck.automated && pendingCheck.automatedEventRuns?.length) {
+          const remainingAutomatedRuns = pendingCheck.automatedEventRuns;
+          resetCaptcha();
+          await clearAutoCaptchaCooldown(event.id);
+          const continuation = await runAutomatedEventRuns(remainingAutomatedRuns);
+          if (!continuation.paused) await refresh();
+          return;
+        }
         const resumeEventIds = pendingCheck.resumeEventIds || [];
         if (resumeEventIds.length) {
           const remainingEvents = resumeEventIds
@@ -1457,6 +1949,56 @@ function TripPlannerApp() {
     if (navigationRef.isReady()) {
       navigationRef.navigate('Calendar');
     }
+  }
+
+  function openCreateTripForm() {
+    setEditingEvent(null);
+    setDraftEvent(null);
+    setFormVisible(true);
+  }
+
+  function openEditTripForm(event) {
+    setDraftEvent(null);
+    setEditingEvent(event);
+    setFormVisible(true);
+  }
+
+  function closeTripForm() {
+    setFormVisible(false);
+    setEditingEvent(null);
+    setDraftEvent(null);
+  }
+
+  function openSeatCheckFromHoliday(event, targetOccurrence = null) {
+    const coveredSeatCheckDates = new Set(
+      events
+        .filter((item) => item.id !== event.id && item.trip_type === 'seat_check')
+        .flatMap((item) => item.occurrences || [])
+        .map((occurrence) => occurrence.travel_date)
+        .filter(Boolean)
+    );
+    const sourceOccurrences = targetOccurrence ? [targetOccurrence] : (event.occurrences || []);
+    const openDates = selectedDatesInsideBookingWindow(sourceOccurrences.map((occurrence) => ({
+      date: occurrence.travel_date,
+      source_label: occurrence.source_label || event.holiday_name || 'Selected date'
+    }))).filter((item) => !coveredSeatCheckDates.has(item.date));
+    if (!openDates.length) {
+      Alert.alert('No open dates', 'Seat Check Trips can only be created for dates inside the booking window.');
+      return;
+    }
+
+    setEditingEvent(null);
+    setDraftEvent({
+      trip_type: 'seat_check',
+      name: `${event.name} seat check`,
+      recurrence_type: 'weekly',
+      weekday: '',
+      selected_dates: openDates,
+      booking_window_reminders: false,
+      check_times: DEFAULT_CHECK_TIMES,
+      is_active: true
+    });
+    setFormVisible(true);
   }
 
   async function openRailConnect(event, occurrence) {
@@ -1570,11 +2112,14 @@ function TripPlannerApp() {
                 runAllEventChecks={runAllEventChecks}
                 runEventCheck={runEventCheck}
                 openEventCalendar={openEventCalendar}
-                setEditingEvent={setEditingEvent}
-                setFormVisible={setFormVisible}
+                openCreateTripForm={openCreateTripForm}
+                openEditTripForm={openEditTripForm}
+                openSeatCheckFromHoliday={openSeatCheckFromHoliday}
                 eventRecurrenceLabel={eventRecurrenceLabel}
+                eventTypeLabel={eventTypeLabel}
                 eventLastCheckedAt={eventLastCheckedAt}
                 nextCheckText={nextCheckText}
+                hasCompleteRailDetails={hasCompleteRailDetails}
               />
             )}
           </Tab.Screen>
@@ -1601,6 +2146,16 @@ function TripPlannerApp() {
                 calendarAvailabilityValue={calendarAvailabilityValue}
                 formatBookingDate={formatBookingDate}
                 formatFriendlyBookingDate={formatFriendlyBookingDate}
+                hasCompleteRailDetails={hasCompleteRailDetails}
+                occurrenceBookingOpenText={occurrenceBookingOpenText}
+                coveredSeatCheckDates={new Set(
+                  events
+                    .filter((event) => event.trip_type === 'seat_check')
+                    .flatMap((event) => event.occurrences || [])
+                    .map((occurrence) => occurrence.travel_date)
+                    .filter(Boolean)
+                )}
+                openSeatCheckFromHoliday={openSeatCheckFromHoliday}
               />
             )}
           </Tab.Screen>
@@ -1633,7 +2188,8 @@ function TripPlannerApp() {
       <EventFormModal
         visible={formVisible}
         editingEvent={editingEvent}
-        onClose={() => setFormVisible(false)}
+        draftEvent={draftEvent}
+        onClose={closeTripForm}
         onSaveTrip={saveEventFromForm}
       />
       <CaptchaModal
@@ -1922,6 +2478,30 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     flexShrink: 1
   },
+  tripWarning: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#f0cf8a',
+    backgroundColor: '#fff8eb',
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    marginTop: 8,
+    marginBottom: 6,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8
+  },
+  tripWarningTitle: {
+    color: '#8a5300',
+    fontSize: 13,
+    fontWeight: '900'
+  },
+  tripWarningText: {
+    color: '#6f4b13',
+    fontSize: 12,
+    lineHeight: 16,
+    marginTop: 2
+  },
   availabilityRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -2177,6 +2757,66 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     fontSize: 15
   },
+  formSection: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#c7d2df',
+    backgroundColor: '#fff',
+    marginBottom: 14,
+    position: 'relative',
+    zIndex: 1,
+    elevation: 1
+  },
+  formSectionActive: {
+    zIndex: 900,
+    elevation: 900
+  },
+  formSectionHeader: {
+    minHeight: 54,
+    borderTopLeftRadius: 8,
+    borderTopRightRadius: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#c7d2df',
+    backgroundColor: '#d6e2ed',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10
+  },
+  formSectionHeaderCollapsed: {
+    borderBottomWidth: 0,
+    borderBottomLeftRadius: 8,
+    borderBottomRightRadius: 8
+  },
+  formSectionContent: {
+    paddingHorizontal: 12,
+    paddingTop: 12,
+    paddingBottom: 2
+  },
+  formSectionStep: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    overflow: 'hidden',
+    backgroundColor: '#1d3557',
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '900',
+    lineHeight: 26,
+    textAlign: 'center'
+  },
+  formSectionTitle: {
+    color: '#172033',
+    fontSize: 14,
+    fontWeight: '900'
+  },
+  formSectionBody: {
+    color: '#3f5068',
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 2
+  },
   suggestionList: {
     position: 'absolute',
     top: 70,
@@ -2218,128 +2858,21 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 10
   },
-  timeChipGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8
-  },
-  timeChip: {
-    minHeight: 38,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#cbd6e3',
-    backgroundColor: '#fff',
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6
-  },
-  timeChipText: {
-    color: '#1d3557',
-    fontSize: 13,
-    fontWeight: '900'
-  },
-  timeChipRemove: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#eef2f6'
-  },
-  timeAddButton: {
-    minHeight: 38,
-    borderRadius: 8,
-    backgroundColor: '#1d3557',
-    paddingHorizontal: 12,
-    paddingVertical: 7,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6
-  },
-  timeAddButtonText: {
-    color: '#fff',
-    fontSize: 13,
-    fontWeight: '900'
-  },
-  timePickerBackdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(23, 32, 51, 0.45)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 18
-  },
-  timePickerPanel: {
-    width: '100%',
-    maxWidth: 340,
-    borderRadius: 8,
-    backgroundColor: '#f6f8fb',
-    paddingBottom: 14
-  },
-  timePickerContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 14,
-    paddingHorizontal: 16,
-    paddingTop: 4
-  },
-  timeStepper: {
-    alignItems: 'center',
-    gap: 6
-  },
-  timeStepButton: {
-    width: 48,
-    height: 36,
-    borderRadius: 8,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#eaf0f6'
-  },
-  timeInput: {
-    width: 64,
-    height: 52,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#ced7e4',
-    backgroundColor: '#fff',
-    color: '#172033',
-    textAlign: 'center',
-    fontSize: 24,
-    fontWeight: '900'
-  },
-  timeSeparator: {
-    color: '#172033',
-    fontSize: 28,
-    fontWeight: '900',
-    paddingBottom: 20
-  },
-  timePartLabel: {
-    color: '#60708a',
-    fontSize: 12,
-    fontWeight: '800',
-    textTransform: 'uppercase'
-  },
-  timePickerPreview: {
-    alignItems: 'center',
-    marginTop: 12
-  },
-  timePickerPreviewText: {
-    color: '#1d3557',
-    fontSize: 16,
-    fontWeight: '900'
-  },
-  timePickerWarning: {
-    color: '#a9162a',
-    fontSize: 12,
-    fontWeight: '800',
-    marginTop: 4
-  },
   formValidationText: {
     color: '#a9162a',
     fontSize: 13,
     fontWeight: '800',
+    marginBottom: 10
+  },
+  formActionFooter: {
+    marginTop: 2,
+    marginBottom: 6
+  },
+  trainSectionNote: {
+    color: '#60708a',
+    fontSize: 12,
+    lineHeight: 17,
+    fontWeight: '700',
     marginBottom: 10
   },
   weekdayGrid: {
@@ -2394,6 +2927,282 @@ const styles = StyleSheet.create({
   twoColActive: {
     zIndex: 900,
     elevation: 900
+  },
+  holidayPicker: {
+    marginBottom: 10
+  },
+  holidayWindowSummary: {
+    minHeight: 54,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#dbe3ee',
+    backgroundColor: '#f8fafc',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9
+  },
+  holidayWindowTitle: {
+    color: '#172033',
+    fontSize: 13,
+    fontWeight: '900'
+  },
+  holidayWindowText: {
+    color: '#60708a',
+    fontSize: 12,
+    lineHeight: 16,
+    marginTop: 2
+  },
+  selectedDateGrid: {
+    gap: 8,
+    marginBottom: 12
+  },
+  selectedDateChip: {
+    minHeight: 46,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#cbd6e3',
+    backgroundColor: '#fff',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8
+  },
+  selectedDateText: {
+    color: '#172033',
+    fontSize: 13,
+    fontWeight: '900'
+  },
+  selectedDateHolidayName: {
+    color: '#1d3557',
+    fontSize: 12,
+    fontWeight: '800',
+    marginTop: 2
+  },
+  selectedDateMeta: {
+    color: '#60708a',
+    fontSize: 12,
+    marginTop: 2
+  },
+  holidayBulkButton: {
+    minHeight: 58,
+    borderRadius: 8,
+    borderWidth: 1.5,
+    borderColor: '#1d3557',
+    backgroundColor: '#f7fbff',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10
+  },
+  holidayBulkButtonDisabled: {
+    opacity: 0.55
+  },
+  holidayBulkIcon: {
+    width: 34,
+    height: 34,
+    borderRadius: 8,
+    backgroundColor: '#1d3557',
+    alignItems: 'center',
+    justifyContent: 'center'
+  },
+  holidayBulkButtonText: {
+    color: '#1d3557',
+    fontSize: 14,
+    fontWeight: '900'
+  },
+  holidayBulkHint: {
+    color: '#526175',
+    fontSize: 12,
+    lineHeight: 16,
+    marginTop: 2
+  },
+  holidayBulkClearButton: {
+    alignSelf: 'flex-start',
+    minHeight: 36,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#cbd6e3',
+    backgroundColor: '#fff',
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+    marginTop: -6,
+    marginBottom: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6
+  },
+  holidayBulkClearText: {
+    color: '#1d3557',
+    fontSize: 12,
+    fontWeight: '900'
+  },
+  calendarPicker: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#dbe3ee',
+    backgroundColor: '#fff',
+    padding: 10,
+    marginBottom: 14
+  },
+  calendarHeader: {
+    minHeight: 36,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8
+  },
+  calendarNavButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 8,
+    backgroundColor: '#eaf0f6',
+    alignItems: 'center',
+    justifyContent: 'center'
+  },
+  calendarMonthTitle: {
+    flex: 1,
+    color: '#172033',
+    fontSize: 15,
+    fontWeight: '900',
+    textAlign: 'center'
+  },
+  calendarWeekdayRow: {
+    flexDirection: 'row',
+    marginBottom: 5
+  },
+  calendarWeekday: {
+    width: `${100 / 7}%`,
+    color: '#60708a',
+    fontSize: 11,
+    fontWeight: '900',
+    textAlign: 'center'
+  },
+  calendarGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap'
+  },
+  calendarDay: {
+    width: `${100 / 7}%`,
+    height: 46,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#edf1f6',
+    backgroundColor: '#f8fafc',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 2,
+    marginBottom: 4
+  },
+  calendarDayOutside: {
+    opacity: 0.45
+  },
+  calendarDayHoliday: {
+    backgroundColor: '#fff8eb',
+    borderColor: '#f3d49a'
+  },
+  calendarDaySelected: {
+    backgroundColor: '#1d3557',
+    borderColor: '#1d3557',
+    opacity: 1
+  },
+  calendarDayDisabled: {
+    opacity: 0.32
+  },
+  calendarDayNumber: {
+    color: '#172033',
+    fontSize: 13,
+    fontWeight: '900'
+  },
+  calendarHolidayName: {
+    width: '100%',
+    color: '#8a5300',
+    fontSize: 8,
+    fontWeight: '900',
+    textAlign: 'center',
+    marginTop: 1
+  },
+  calendarDayTextSelected: {
+    color: '#fff'
+  },
+  holidaySearchField: {
+    minHeight: 42,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#ced7e4',
+    backgroundColor: '#fff',
+    paddingHorizontal: 10,
+    marginBottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8
+  },
+  holidaySearchInput: {
+    flex: 1,
+    minWidth: 0,
+    color: '#172033',
+    fontSize: 14,
+    paddingVertical: 0
+  },
+  holidaySearchClear: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#eef2f6'
+  },
+  holidaySearchResults: {
+    maxHeight: 228,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e1e7ef',
+    backgroundColor: '#f8fafc',
+    marginTop: -2,
+    marginBottom: 14
+  },
+  holidaySearchResultsContent: {
+    padding: 6
+  },
+  holidaySearchResult: {
+    minHeight: 48,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e1e7ef',
+    backgroundColor: '#fff',
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    marginBottom: 6,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10
+  },
+  holidaySearchResultSelected: {
+    backgroundColor: '#1d3557',
+    borderColor: '#1d3557'
+  },
+  holidaySearchResultName: {
+    color: '#172033',
+    fontSize: 13,
+    fontWeight: '900'
+  },
+  holidaySearchResultDate: {
+    color: '#60708a',
+    fontSize: 12,
+    fontWeight: '800',
+    marginTop: 2
+  },
+  holidayEmptyText: {
+    color: '#60708a',
+    fontSize: 13,
+    fontWeight: '800',
+    textAlign: 'center',
+    paddingVertical: 18
   },
   switchRow: {
     flexDirection: 'row',
@@ -2481,6 +3290,45 @@ const styles = StyleSheet.create({
     borderColor: '#e1e7ef',
     backgroundColor: '#fff',
     alignItems: 'center'
+  },
+  firstRunPanel: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e1e7ef',
+    backgroundColor: '#fff',
+    padding: 16
+  },
+  firstRunHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+    marginBottom: 14
+  },
+  howItWorksList: {
+    gap: 9,
+    marginBottom: 14
+  },
+  howItWorksItem: {
+    minHeight: 32,
+    borderRadius: 8,
+    backgroundColor: '#f8fafc',
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9
+  },
+  howItWorksText: {
+    color: '#31405a',
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: '800',
+    flex: 1
+  },
+  firstRunButton: {
+    alignSelf: 'stretch',
+    flex: 0,
+    width: '100%'
   },
   emptyTitle: {
     color: '#172033',

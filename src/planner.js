@@ -22,11 +22,15 @@ import {
 import { requestAvailability } from './railClient';
 import {
   ADVANCE_DAYS,
+  BOOKING_WINDOW_OPEN_REMINDER_TIME,
   BOOKING_WINDOW_REMINDER_DAYS,
   currentLocalTime,
+  DEFAULT_CHECK_TIMES,
   formatAvailabilitySummary,
   formatShortDate,
   generateTravelDates,
+  hasCompleteRailDetails,
+  isSelectedDateTrip,
   isBelowThresholdStatus,
   nowIso,
   parseAvailability
@@ -128,6 +132,12 @@ function dueScheduledTimes(checkTimes, localTime) {
     });
 }
 
+function isAtOrAfterTime(localTime, thresholdTime) {
+  const localValue = checkTimeValue(localTime);
+  const thresholdValue = checkTimeValue(thresholdTime);
+  return localValue !== null && thresholdValue !== null && localValue >= thresholdValue;
+}
+
 async function createCaptchaNotificationOncePerDay(event, runDate, options = {}) {
   if (options.suppressCaptchaNotifications) return;
 
@@ -181,7 +191,9 @@ async function recordOccurrenceFromRaw(row, raw, options = {}) {
 }
 
 export async function validateTripAvailability(payload, options = {}) {
-  const travelDates = generateTravelDates(payload, ADVANCE_DAYS);
+  const travelDates = isSelectedDateTrip(payload)
+    ? (payload.selected_dates || []).map((item) => item.date)
+    : generateTravelDates(payload, ADVANCE_DAYS);
   const travelDate = travelDates[0];
   if (!travelDate) {
     return {
@@ -234,6 +246,14 @@ export async function validateTripAvailability(payload, options = {}) {
 export async function checkEvent(eventId, options = {}) {
   const event = await getEvent(eventId);
   if (!event) return { notFound: true };
+  if (!hasCompleteRailDetails(event)) {
+    return {
+      eventId: Number(eventId),
+      checked: 0,
+      skipped: true,
+      reason: 'Train details are incomplete'
+    };
+  }
 
   const rows = await getPendingOccurrencesForEvent(eventId, {
     includeAllStatuses: Boolean(options.includeAllStatuses)
@@ -289,6 +309,7 @@ export async function runDueScheduledChecks() {
 export async function runBookingWindowReminders(options = {}) {
   await ensureFutureOccurrences(false);
   const today = dayjs().startOf('day');
+  const localTime = options.localTime || currentLocalTime();
   const candidates = await getBookingWindowReminderCandidates();
   let reminded = 0;
 
@@ -296,6 +317,7 @@ export async function runBookingWindowReminders(options = {}) {
     const bookingOpenDate = dayjs(row.travel_date).subtract(ADVANCE_DAYS, 'day').startOf('day');
     const daysBefore = bookingOpenDate.diff(today, 'day');
     if (!BOOKING_WINDOW_REMINDER_DAYS.includes(daysBefore)) continue;
+    if (daysBefore === 0 && !isAtOrAfterTime(localTime, BOOKING_WINDOW_OPEN_REMINDER_TIME)) continue;
     if (await hasBookingWindowReminderRun(row.event_id, row.travel_date, daysBefore)) continue;
 
     await createBookingWindowReminderNotification(
@@ -318,11 +340,12 @@ export async function runDueScheduledChecksWithOptions(options = {}) {
   const reminderResult = await runBookingWindowReminders(options);
   await ensureFutureOccurrences(true);
   const events = await getActiveEvents();
+  const dueEventRuns = [];
   let checked = 0;
   let captchaRequired = false;
 
   for (const event of events) {
-    const checkTimes = String(event.check_times || '08:00,13:00,20:00').split(',').map((item) => item.trim());
+    const checkTimes = String(event.check_times || DEFAULT_CHECK_TIMES).split(',').map((item) => item.trim());
     const dueTimes = dueScheduledTimes(checkTimes, localTime);
     if (!dueTimes.length) continue;
 
@@ -331,6 +354,19 @@ export async function runDueScheduledChecksWithOptions(options = {}) {
       if (!(await hasRun(event.id, runDate, time))) unrunDueTimes.push(time);
     }
     if (!unrunDueTimes.length) continue;
+
+    dueEventRuns.push({
+      eventId: event.id,
+      eventName: event.name,
+      runDate,
+      scheduledTimes: unrunDueTimes
+    });
+  }
+
+  for (let index = 0; index < dueEventRuns.length; index += 1) {
+    const dueEventRun = dueEventRuns[index];
+    const event = events.find((item) => item.id === dueEventRun.eventId);
+    if (!event) continue;
 
     const result = await checkEvent(event.id, { automated: true, deepCheck: true });
     if (result.captchaRequired) {
@@ -341,11 +377,14 @@ export async function runDueScheduledChecksWithOptions(options = {}) {
         captchaRequired,
         captchaEventId: event.id,
         captchaEventName: event.name,
-        captchaRunDate: runDate,
-        captchaScheduledTimes: unrunDueTimes
+        captchaRunDate: dueEventRun.runDate,
+        captchaScheduledTimes: dueEventRun.scheduledTimes,
+        captchaResumeEventRuns: dueEventRuns.slice(index + 1),
+        captchaResumeEventIds: dueEventRuns.slice(index + 1).map((item) => item.eventId),
+        reminded: reminderResult.reminded
       };
     } else {
-      await recordRuns(event.id, runDate, unrunDueTimes);
+      await recordRuns(event.id, dueEventRun.runDate, dueEventRun.scheduledTimes);
       checked += result.checked || 0;
     }
   }

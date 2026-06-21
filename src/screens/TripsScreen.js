@@ -2,7 +2,69 @@ import React from 'react';
 import { Alert, Text, TouchableOpacity, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { deleteEvent } from '../database';
-import { formatDateTime, normalizeRecurrenceType } from '../utils';
+import { ADVANCE_DAYS, formatDateTime, normalizeRecurrenceType } from '../utils';
+
+function localDateFromIso(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
+  if (!match) return new Date(value);
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+}
+
+function formatTripDate(dateOrValue) {
+  return new Date(dateOrValue).toLocaleDateString('en-IN', {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric'
+  });
+}
+
+function occurrencesInsideBookingWindow(event) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const bookingEnd = new Date(today);
+  bookingEnd.setDate(bookingEnd.getDate() + ADVANCE_DAYS);
+  bookingEnd.setHours(0, 0, 0, 0);
+
+  return (event.occurrences || []).filter((occurrence) => {
+    const travelDate = localDateFromIso(occurrence.travel_date);
+    return travelDate >= today && travelDate <= bookingEnd;
+  });
+}
+
+function seatCheckTravelDateSet(events) {
+  return new Set(
+    (events || [])
+      .filter((event) => event.trip_type === 'seat_check')
+      .flatMap((event) => event.occurrences || [])
+      .map((occurrence) => occurrence.travel_date)
+      .filter(Boolean)
+  );
+}
+
+function bookingWindowWarning(event, coveredTravelDates = new Set()) {
+  const openOccurrences = occurrencesInsideBookingWindow(event)
+    .filter((occurrence) => !coveredTravelDates.has(occurrence.travel_date));
+  if (!openOccurrences.length) return null;
+
+  if (openOccurrences.length === 1) {
+    return {
+      title: `Booking open for ${formatTripDate(localDateFromIso(openOccurrences[0].travel_date))}`,
+      body: 'Create a Seat Check Trip to monitor availability for this selected date.'
+    };
+  }
+
+  const dateList = openOccurrences
+    .slice(0, 2)
+    .map((occurrence) => formatTripDate(localDateFromIso(occurrence.travel_date)))
+    .join(', ');
+  const extraCount = openOccurrences.length - 2;
+
+  return {
+    title: `${openOccurrences.length} selected dates are inside the booking window`,
+    body: `${dateList}${extraCount > 0 ? `, +${extraCount} more` : ''}. Create a Seat Check Trip to monitor availability.`
+  };
+}
 
 export default function TripsScreen({
   styles,
@@ -20,12 +82,17 @@ export default function TripsScreen({
   runAllEventChecks,
   runEventCheck,
   openEventCalendar,
-  setEditingEvent,
-  setFormVisible,
+  openCreateTripForm,
+  openEditTripForm,
+  openSeatCheckFromHoliday,
   eventRecurrenceLabel,
+  eventTypeLabel,
   eventLastCheckedAt,
-  nextCheckText
+  nextCheckText,
+  hasCompleteRailDetails
 }) {
+  const coveredSeatCheckDates = seatCheckTravelDateSet(events);
+
   return (
     <Screen>
       <View style={styles.topBar}>
@@ -49,10 +116,7 @@ export default function TripsScreen({
           </TouchableOpacity>
           <TouchableOpacity
             style={styles.addButton}
-            onPress={() => {
-              setEditingEvent(null);
-              setFormVisible(true);
-            }}
+            onPress={openCreateTripForm}
           >
             <Ionicons name="add" size={24} color="#fff" />
           </TouchableOpacity>
@@ -60,8 +124,45 @@ export default function TripsScreen({
       </View>
 
       {!events.length ? (
-        <EmptyState title="No trips yet" body="Create a recurring train trip to generate travel dates." />
-      ) : events.map((event) => (
+        <View style={styles.firstRunPanel}>
+          <View style={styles.firstRunHeader}>
+            <Ionicons name="train-outline" size={30} color="#1d3557" />
+            <View style={styles.flexOne}>
+              <Text style={styles.emptyTitle}>No trips yet</Text>
+              <Text style={styles.emptyBody}>
+                Create a trip to get booking-window reminders and automatic seat alerts.
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.howItWorksList}>
+            {[
+              ['calendar-outline', 'Choose regular travel or holiday dates'],
+              ['notifications-outline', 'We remind you before railway booking opens'],
+              ['train-outline', 'Add train details to enable automatic seat checks']
+            ].map(([icon, text]) => (
+              <View key={text} style={styles.howItWorksItem}>
+                <Ionicons name={icon} size={17} color="#1d3557" />
+                <Text style={styles.howItWorksText}>{text}</Text>
+              </View>
+            ))}
+          </View>
+
+          <TouchableOpacity
+            style={[styles.button, styles.button_primary, styles.firstRunButton]}
+            onPress={openCreateTripForm}
+            activeOpacity={0.85}
+          >
+            <Ionicons name="add" size={17} color="#fff" />
+            <Text style={styles.buttonText}>Create first trip</Text>
+          </TouchableOpacity>
+        </View>
+      ) : events.map((event) => {
+        const railReady = hasCompleteRailDetails(event);
+        const holidayTrip = event.trip_type === 'holiday';
+        const seatCheckTrip = event.trip_type === 'seat_check';
+        const openBookingWarning = holidayTrip ? bookingWindowWarning(event, coveredSeatCheckDates) : null;
+        return (
         <TouchableOpacity
           key={event.id}
           style={[styles.card, selectedEventId === event.id && styles.cardSelected]}
@@ -70,30 +171,59 @@ export default function TripsScreen({
         >
           <View style={styles.cardHeader}>
             <Text style={styles.cardTitle}>{event.name}</Text>
-            <Pill label={event.is_active ? 'Active' : 'Inactive'} tone={event.is_active ? 'success' : 'neutral'} />
+            <Pill label={holidayTrip ? 'Reminder only' : (event.is_active ? 'Active' : 'Inactive')} tone={event.is_active ? 'success' : 'neutral'} />
           </View>
-          <Text style={styles.primaryLine}>{eventRecurrenceLabel(event)} · {event.train_no}</Text>
-          <Text style={styles.metaLine}>{event.source_station} → {event.destination_station}</Text>
-          <Text style={styles.metaLine}>{event.class_code} / {event.quota} · alert when seats are ≤ {event.threshold}</Text>
-          {normalizeRecurrenceType(event.recurrence_type) !== 'weekly' && (
+          <Text style={styles.primaryLine}>{eventTypeLabel(event)} · {eventRecurrenceLabel(event)}</Text>
+          {railReady ? (
+            <>
+              <Text style={styles.metaLine}>{event.train_no} · {event.source_station} → {event.destination_station}</Text>
+              <Text style={styles.metaLine}>{event.class_code} / {event.quota} · alert when seats are below {event.threshold}</Text>
+            </>
+          ) : holidayTrip ? (
+            <Text style={styles.metaLine}>Booking-window reminders only. Create a Seat Check Trip when booking opens.</Text>
+          ) : (
+            <Text style={styles.metaLine}>Train details not added; booking reminders can still run.</Text>
+          )}
+          {!holidayTrip && !seatCheckTrip && normalizeRecurrenceType(event.recurrence_type) !== 'weekly' && (
             <Text style={styles.metaLine}>Start date: {event.start_date}</Text>
           )}
+          {(holidayTrip || seatCheckTrip) && (
+            <Text style={styles.metaLine}>Selected dates: {event.occurrences?.length || 0}</Text>
+          )}
+          {openBookingWarning ? (
+            <View style={styles.tripWarning}>
+              <Ionicons name="alert-circle-outline" size={17} color="#8a5300" />
+              <View style={styles.flexOne}>
+                <Text style={styles.tripWarningTitle}>{openBookingWarning.title}</Text>
+                <Text style={styles.tripWarningText}>{openBookingWarning.body}</Text>
+              </View>
+            </View>
+          ) : null}
           <Text style={styles.metaLine}>
             Booking reminders: {event.booking_window_reminders ? 'enabled' : 'disabled'}
           </Text>
-          <Text style={styles.metaLine}>Last checked: {formatDateTime(eventLastCheckedAt(event))}</Text>
+          {railReady && <Text style={styles.metaLine}>Last checked: {formatDateTime(eventLastCheckedAt(event))}</Text>}
           <Text style={styles.metaLine}>Next check: {nextCheckText(event)}</Text>
-          <Text style={styles.metaLine}>Seat checks: {event.check_times}</Text>
           <View style={styles.rowActions}>
-            <IconButton
-              icon="flash-outline"
-              label="Check"
-              onPress={() => withBusy(() => runEventCheck(event, '', false), {
-                title: 'Checking trip availability',
-                detail: `${event.name} is checking the next available occurrence group.`
-              })}
-              disabled={busy}
-            />
+            {openBookingWarning ? (
+              <IconButton
+                icon="add-circle-outline"
+                label="Create seat check"
+                onPress={() => openSeatCheckFromHoliday(event)}
+                disabled={busy}
+              />
+            ) : null}
+            {!holidayTrip ? (
+              <IconButton
+                icon="flash-outline"
+                label="Check"
+                onPress={() => withBusy(() => runEventCheck(event, '', false), {
+                  title: 'Checking trip availability',
+                  detail: `${event.name} is checking the next available occurrence group.`
+                })}
+                disabled={busy || !railReady}
+              />
+            ) : null}
           </View>
           <View style={styles.rowActions}>
             <IconButton
@@ -101,8 +231,7 @@ export default function TripsScreen({
               label="Edit"
               tone="secondary"
               onPress={() => {
-                setEditingEvent(event);
-                setFormVisible(true);
+                openEditTripForm(event);
               }}
             />
             <IconButton
@@ -123,7 +252,8 @@ export default function TripsScreen({
             />
           </View>
         </TouchableOpacity>
-      ))}
+        );
+      })}
     </Screen>
   );
 }

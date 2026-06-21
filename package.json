@@ -4,8 +4,8 @@
   "private": true,
   "main": "index.js",
   "scripts": {
-    "start": "REACT_NATIVE_PACKAGER_HOSTNAME=192.168.1.13 expo start --dev-client --host lan -c",
-    "dev:lan": "REACT_NATIVE_PACKAGER_HOSTNAME=192.168.1.13 expo start --dev-client --host lan -c",
+    "start": "expo start --dev-client --host lan -c",
+    "dev:lan": "expo start --dev-client --host lan -c",
     "android": "expo start --android --host lan",
     "ios": "expo start --ios --host lan",
     "doctor": "npx expo-doctor",

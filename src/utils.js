@@ -1,15 +1,21 @@
 import dayjs from 'dayjs';
 
 export const ADVANCE_DAYS = 60;
-export const BOOKING_WINDOW_REMINDER_DAYS = [2, 1];
+export const BOOKING_WINDOW_REMINDER_DAYS = [2, 1, 0];
+export const BOOKING_WINDOW_OPEN_REMINDER_TIME = '06:00';
 export const OCCURRENCE_GENERATION_DAYS = ADVANCE_DAYS + Math.max(...BOOKING_WINDOW_REMINDER_DAYS);
 export const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-export const DEFAULT_CHECK_TIMES = '08:00,13:00,20:00';
+export const DEFAULT_CHECK_TIMES = '06:00,13:00,20:00';
 export const RECURRENCE_OPTIONS = [
   { value: 'daily', label: 'Daily' },
   { value: 'weekly', label: 'Weekly' },
   { value: 'fortnightly', label: '15 days' },
   { value: 'monthly', label: 'Monthly' }
+];
+export const TRIP_TYPE_OPTIONS = [
+  { value: 'regular', label: 'Regular Trip' },
+  { value: 'holiday', label: 'Holiday Travel' },
+  { value: 'seat_check', label: 'Seat Check Trip' }
 ];
 export const CLASS_OPTIONS = [
   { value: '1A', label: 'FIRST AC' },
@@ -50,6 +56,26 @@ const EVENT_FIELD_LABELS = {
   source_station: 'From station',
   destination_station: 'To station'
 };
+
+export function normalizeTripType(value) {
+  const normalized = String(value || 'regular').trim().toLowerCase();
+  if (normalized === 'holiday') return 'holiday';
+  if (normalized === 'seat_check' || normalized === 'seat-check' || normalized === 'seatcheck') return 'seat_check';
+  return 'regular';
+}
+
+export function isHolidayTrip(eventOrPayload) {
+  return normalizeTripType(eventOrPayload?.trip_type ?? eventOrPayload?.tripType) === 'holiday';
+}
+
+export function isSeatCheckTrip(eventOrPayload) {
+  return normalizeTripType(eventOrPayload?.trip_type ?? eventOrPayload?.tripType) === 'seat_check';
+}
+
+export function isSelectedDateTrip(eventOrPayload) {
+  const tripType = normalizeTripType(eventOrPayload?.trip_type ?? eventOrPayload?.tripType);
+  return tripType === 'holiday' || tripType === 'seat_check';
+}
 
 export function nowIso() {
   return new Date().toISOString();
@@ -111,6 +137,31 @@ export function normalizeIsoDate(value, fallback = toIsoDate(new Date())) {
     && parsed.getMonth() === Number(match[2]) - 1
     && parsed.getDate() === Number(match[3]);
   return isValid ? text : fallback;
+}
+
+export function normalizeSelectedHolidayDates(value) {
+  const rawValues = Array.isArray(value) ? value : [];
+  const byDate = new Map();
+
+  for (const item of rawValues) {
+    const date = normalizeIsoDate(
+      typeof item === 'string' ? item : item?.date ?? item?.travel_date ?? item?.travelDate,
+      ''
+    );
+    if (!date) continue;
+
+    const sourceLabel = String(
+      typeof item === 'string'
+        ? 'Custom date'
+        : item?.source_label ?? item?.sourceLabel ?? item?.name ?? item?.label ?? 'Custom date'
+    ).trim() || 'Custom date';
+
+    if (!byDate.has(date) || byDate.get(date).source_label === 'Custom date') {
+      byDate.set(date, { date, source_label: sourceLabel });
+    }
+  }
+
+  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
 }
 
 export function normalizeCheckTimes(value) {
@@ -397,7 +448,12 @@ function optionCodeFromInput(value, options) {
 export function normalizeEventPayload(body) {
   const thresholdInput = body.threshold;
   const threshold = String(thresholdInput).trim() === '' ? Number.NaN : Number(thresholdInput);
-  const checkTimesInput = body.check_times ?? body.checkTimes ?? '';
+  const rawCheckTimesInput = body.check_times ?? body.checkTimes;
+  const checkTimesInput = rawCheckTimesInput === undefined
+    || rawCheckTimesInput === null
+    || String(rawCheckTimesInput).trim() === ''
+    ? DEFAULT_CHECK_TIMES
+    : rawCheckTimesInput;
   const checkTimes = normalizeCheckTimes(checkTimesInput);
   const recurrenceType = normalizeRecurrenceType(body.recurrence_type ?? body.recurrenceType);
   const startDateInput = body.start_date ?? body.startDate ?? toIsoDate(new Date());
@@ -405,8 +461,10 @@ export function normalizeEventPayload(body) {
   const isActive = body.is_active === undefined && body.isActive === undefined
     ? 1
     : Number(Boolean(body.is_active ?? body.isActive));
+  const tripType = normalizeTripType(body.trip_type ?? body.tripType);
 
   return {
+    trip_type: tripType,
     name: String(body.name || '').trim(),
     weekday: normalizeWeekday(body.weekday),
     recurrence_type: recurrenceType,
@@ -423,30 +481,78 @@ export function normalizeEventPayload(body) {
     invalid_check_times: invalidCheckTimes(checkTimesInput),
     invalid_start_date: !startDate,
     booking_window_reminders: Number(Boolean(body.booking_window_reminders ?? body.bookingWindowReminders)),
-    is_active: isActive
+    is_active: isActive,
+    selected_dates: normalizeSelectedHolidayDates(body.selected_dates ?? body.selectedDates)
   };
 }
 
+export function hasCompleteRailDetails(eventOrPayload) {
+  return Boolean(
+    eventOrPayload?.train_no
+      && eventOrPayload?.class_code
+      && eventOrPayload?.quota
+      && eventOrPayload?.source_station
+      && eventOrPayload?.destination_station
+  );
+}
+
+export function hasAnyRailDetails(eventOrPayload) {
+  return Boolean(
+    eventOrPayload?.train_no
+      || eventOrPayload?.class_code
+      || eventOrPayload?.quota
+      || eventOrPayload?.source_station
+      || eventOrPayload?.destination_station
+  );
+}
+
 export function validateEventPayload(payload) {
-  const required = ['name', 'train_no', 'class_code', 'quota', 'source_station', 'destination_station'];
-  if (payload.recurrence_type === 'weekly') required.push('weekday');
+  const required = ['name'];
+  const holidayTrip = isHolidayTrip(payload);
+  const seatCheckTrip = isSeatCheckTrip(payload);
+  const selectedDateTrip = isSelectedDateTrip(payload);
+  const railDetailsRequired = !holidayTrip;
+
+  if (railDetailsRequired) {
+    required.push('train_no', 'class_code', 'quota', 'source_station', 'destination_station');
+  }
+  if (!selectedDateTrip && payload.recurrence_type === 'weekly') required.push('weekday');
   const missing = required.filter((field) => !payload[field]);
   if (missing.length) {
     return `Please fill: ${missing.map((field) => EVENT_FIELD_LABELS[field] || field).join(', ')}`;
   }
-  if (!RECURRENCE_OPTIONS.some((option) => option.value === payload.recurrence_type)) return 'Choose a valid travel frequency';
-  if (payload.invalid_start_date || !/^\d{4}-\d{2}-\d{2}$/.test(payload.start_date)) return 'Start date must use YYYY-MM-DD';
-  if (!/^\d{4,6}$/.test(payload.train_no)) return 'Train number must be 4 to 6 digits';
-  if (!CLASS_OPTIONS.some((option) => option.value === payload.class_code)) return 'Choose a valid class';
-  if (!QUOTA_OPTIONS.some((option) => option.value === payload.quota)) return 'Choose a valid quota';
-  if (!/^[A-Z0-9]{2,6}$/.test(payload.source_station)) return 'From station must be a 2 to 6 character station code';
-  if (!/^[A-Z0-9]{2,6}$/.test(payload.destination_station)) return 'To station must be a 2 to 6 character station code';
-  if (payload.source_station === payload.destination_station) return 'From and To stations must be different';
-  if (payload.is_active && payload.invalid_threshold) return 'Seat alert limit is required for active monitoring';
-  if (payload.is_active && payload.threshold < 0) return 'Seat alert limit must be zero or greater';
-  if (payload.is_active && payload.invalid_check_times?.length) {
+  if (holidayTrip && !payload.selected_dates.length) return 'Choose at least one holiday travel date';
+  if (seatCheckTrip && !payload.selected_dates.length) return 'Choose at least one travel date inside the booking window';
+  if (holidayTrip) {
+    const bookingEnd = dayjs().startOf('day').add(ADVANCE_DAYS, 'day');
+    const insideOrPastWindow = payload.selected_dates.find((item) => {
+      const travelDate = dayjs(item.date).startOf('day');
+      return !travelDate.isAfter(bookingEnd);
+    });
+    if (insideOrPastWindow) return 'Holiday Travel dates must be after the current booking window';
+  }
+  if (seatCheckTrip) {
+    const today = dayjs().startOf('day');
+    const bookingEnd = today.add(ADVANCE_DAYS, 'day');
+    const outsideWindow = payload.selected_dates.find((item) => {
+      const travelDate = dayjs(item.date).startOf('day');
+      return travelDate.isBefore(today) || travelDate.isAfter(bookingEnd);
+    });
+    if (outsideWindow) return 'Seat Check Trip dates must be inside the current booking window';
+  }
+  if (!selectedDateTrip && !RECURRENCE_OPTIONS.some((option) => option.value === payload.recurrence_type)) return 'Choose a valid travel frequency';
+  if (!selectedDateTrip && (payload.invalid_start_date || !/^\d{4}-\d{2}-\d{2}$/.test(payload.start_date))) return 'Start date must use YYYY-MM-DD';
+  if (railDetailsRequired && !/^\d{4,6}$/.test(payload.train_no)) return 'Train number must be 4 to 6 digits';
+  if (railDetailsRequired && !CLASS_OPTIONS.some((option) => option.value === payload.class_code)) return 'Choose a valid class';
+  if (railDetailsRequired && !QUOTA_OPTIONS.some((option) => option.value === payload.quota)) return 'Choose a valid quota';
+  if (railDetailsRequired && !/^[A-Z0-9]{2,6}$/.test(payload.source_station)) return 'From station must be a 2 to 6 character station code';
+  if (railDetailsRequired && !/^[A-Z0-9]{2,6}$/.test(payload.destination_station)) return 'To station must be a 2 to 6 character station code';
+  if (railDetailsRequired && payload.source_station === payload.destination_station) return 'From and To stations must be different';
+  if (payload.is_active && railDetailsRequired && payload.invalid_threshold) return 'Seat alert limit is required for active monitoring';
+  if (payload.is_active && railDetailsRequired && payload.threshold < 0) return 'Seat alert limit must be zero or greater';
+  if (payload.is_active && railDetailsRequired && payload.invalid_check_times?.length) {
     return `Invalid check time(s): ${payload.invalid_check_times.join(', ')}. Use HH:mm in 24-hour time.`;
   }
-  if (payload.is_active && !payload.check_times) return 'At least one check time is required for active monitoring';
+  if (payload.is_active && railDetailsRequired && !payload.check_times) return 'At least one check time is required for active monitoring';
   return '';
 }

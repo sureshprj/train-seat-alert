@@ -32,7 +32,8 @@ export default function useForegroundCatchUp({
           suppressNotifications: false,
           automated: true,
           runDate: result.captchaRunDate,
-          scheduledTimes: result.captchaScheduledTimes || []
+          scheduledTimes: result.captchaScheduledTimes || [],
+          automatedEventRuns: result.captchaResumeEventRuns || []
         });
         return;
       }

@@ -35,7 +35,9 @@ Your phone and computer must be on the same Wi-Fi network. This app uses `expo-d
 
 - Create, edit, delete, and select trips
 - Train number input, class, quota, source station, destination station, seat alert limit, active status
-- User-selectable check times
+- Holiday Travel trips with static India holiday suggestions, surrounding-date selection, and booking-window reminders
+- Seat Check Trips for one or more selected dates inside the current booking window
+- Automatic seat checks at 6 AM, 1 PM, and 8 PM
 - 60-day occurrence generation for the selected weekday
 - Check one travel date or all pending travel dates for a trip
 - Captcha modal only when the direct rail session is inactive or rejected
@@ -87,4 +89,11 @@ If Expo reports package version mismatches, run:
 
 ```sh
 npx expo install --fix
+```
+
+development build
+
+
+```sh
+npx eas-cli build --profile development --platform android
 ```

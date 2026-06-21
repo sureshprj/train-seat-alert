@@ -3,8 +3,12 @@ import dayjs from 'dayjs';
 import {
   ADVANCE_DAYS,
   BOOKING_WINDOW_REMINDER_DAYS,
+  DEFAULT_CHECK_TIMES,
   OCCURRENCE_GENERATION_DAYS,
   generateTravelDates,
+  isHolidayTrip,
+  isSelectedDateTrip,
+  hasCompleteRailDetails,
   normalizeEventPayload,
   nowIso,
   toIsoDate,
@@ -32,9 +36,11 @@ export async function initDatabase() {
 
     CREATE TABLE IF NOT EXISTS trip_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      trip_type TEXT NOT NULL DEFAULT 'regular',
       name TEXT NOT NULL,
       weekday TEXT NOT NULL,
       recurrence_type TEXT NOT NULL DEFAULT 'weekly',
+      holiday_name TEXT,
       start_date TEXT,
       train_no TEXT NOT NULL,
       train_name TEXT,
@@ -45,7 +51,7 @@ export async function initDatabase() {
       threshold INTEGER NOT NULL DEFAULT 20,
       is_active INTEGER NOT NULL DEFAULT 1,
       booking_window_reminders INTEGER NOT NULL DEFAULT 0,
-      check_times TEXT NOT NULL DEFAULT '08:00,13:00,20:00',
+      check_times TEXT NOT NULL DEFAULT '${DEFAULT_CHECK_TIMES}',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -58,6 +64,7 @@ export async function initDatabase() {
       available_count INTEGER,
       user_status TEXT NOT NULL DEFAULT 'pending',
       last_checked_at TEXT,
+      source_label TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       FOREIGN KEY (event_id) REFERENCES trip_events(id) ON DELETE CASCADE,
@@ -113,10 +120,13 @@ export async function initDatabase() {
     );
   `);
 
-  await ensureColumn(db, 'trip_events', 'check_times', "check_times TEXT NOT NULL DEFAULT '08:00,13:00,20:00'");
+  await ensureColumn(db, 'trip_events', 'check_times', `check_times TEXT NOT NULL DEFAULT '${DEFAULT_CHECK_TIMES}'`);
+  await ensureColumn(db, 'trip_events', 'trip_type', "trip_type TEXT NOT NULL DEFAULT 'regular'");
+  await ensureColumn(db, 'trip_events', 'holiday_name', 'holiday_name TEXT');
   await ensureColumn(db, 'trip_events', 'recurrence_type', "recurrence_type TEXT NOT NULL DEFAULT 'weekly'");
   await ensureColumn(db, 'trip_events', 'start_date', 'start_date TEXT');
   await ensureColumn(db, 'trip_events', 'booking_window_reminders', 'booking_window_reminders INTEGER NOT NULL DEFAULT 0');
+  await ensureColumn(db, 'trip_occurrences', 'source_label', 'source_label TEXT');
   await ensureColumn(db, 'trip_occurrences', 'last_alert_signature', 'last_alert_signature TEXT');
   await ensureColumn(db, 'trip_occurrences', 'last_alerted_at', 'last_alerted_at TEXT');
 }
@@ -124,6 +134,8 @@ export async function initDatabase() {
 function mapEvent(row) {
   return row ? {
     ...row,
+    trip_type: row.trip_type || 'regular',
+    holiday_name: row.holiday_name || '',
     recurrence_type: row.recurrence_type || 'weekly',
     start_date: row.start_date || '',
     booking_window_reminders: Boolean(row.booking_window_reminders),
@@ -133,19 +145,33 @@ function mapEvent(row) {
 
 export async function insertOccurrences(eventId, schedule) {
   const db = await getDb();
-  for (const travelDate of generateTravelDates(schedule, OCCURRENCE_GENERATION_DAYS)) {
+  if (!isSelectedDateTrip(schedule)) {
+    for (const travelDate of generateTravelDates(schedule, OCCURRENCE_GENERATION_DAYS)) {
+      const timestamp = nowIso();
+      await db.runAsync(`
+        INSERT OR IGNORE INTO trip_occurrences (event_id, travel_date, user_status, created_at, updated_at)
+        VALUES (?, ?, 'pending', ?, ?)
+      `, eventId, travelDate, timestamp, timestamp);
+    }
+    return;
+  }
+
+  for (const item of schedule.selected_dates || []) {
     const timestamp = nowIso();
     await db.runAsync(`
-      INSERT OR IGNORE INTO trip_occurrences (event_id, travel_date, user_status, created_at, updated_at)
-      VALUES (?, ?, 'pending', ?, ?)
-    `, eventId, travelDate, timestamp, timestamp);
+      INSERT INTO trip_occurrences (event_id, travel_date, source_label, user_status, created_at, updated_at)
+      VALUES (?, ?, ?, 'pending', ?, ?)
+      ON CONFLICT(event_id, travel_date) DO UPDATE SET
+        source_label = excluded.source_label,
+        updated_at = excluded.updated_at
+    `, eventId, item.date, item.source_label || 'Custom date', timestamp, timestamp);
   }
 }
 
 export async function ensureFutureOccurrences(activeOnly = false) {
   const db = await getDb();
   const events = await db.getAllAsync(
-    `SELECT id, weekday, recurrence_type, start_date FROM trip_events${activeOnly ? ' WHERE is_active = 1' : ''}`
+    `SELECT id, trip_type, weekday, recurrence_type, start_date FROM trip_events${activeOnly ? ' WHERE is_active = 1' : ''}`
   );
 
   for (const event of events) {
@@ -164,14 +190,16 @@ export async function createEvent(body) {
   const timestamp = nowIso();
   const result = await db.runAsync(`
     INSERT INTO trip_events (
-      name, weekday, recurrence_type, start_date, train_no, train_name, class_code, quota, source_station,
+      trip_type, name, weekday, recurrence_type, holiday_name, start_date, train_no, train_name, class_code, quota, source_station,
       destination_station, threshold, is_active, booking_window_reminders, check_times,
       created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
+    payload.trip_type,
     payload.name,
     payload.weekday,
     payload.recurrence_type,
+    payload.selected_dates[0]?.source_label || '',
     payload.start_date,
     payload.train_no,
     payload.train_name,
@@ -202,14 +230,16 @@ export async function updateEvent(id, body) {
 
   await db.runAsync(`
     UPDATE trip_events
-    SET name = ?, weekday = ?, recurrence_type = ?, start_date = ?, train_no = ?, train_name = ?, class_code = ?, quota = ?,
+    SET trip_type = ?, name = ?, weekday = ?, recurrence_type = ?, holiday_name = ?, start_date = ?, train_no = ?, train_name = ?, class_code = ?, quota = ?,
       source_station = ?, destination_station = ?, threshold = ?, is_active = ?, booking_window_reminders = ?,
       check_times = ?, updated_at = ?
     WHERE id = ?
   `,
+    payload.trip_type,
     payload.name,
     payload.weekday,
     payload.recurrence_type,
+    payload.selected_dates[0]?.source_label || '',
     payload.start_date,
     payload.train_no,
     payload.train_name,
@@ -225,7 +255,8 @@ export async function updateEvent(id, body) {
     id
   );
 
-  const shapeChanged = [
+  const shapeChanged = isHolidayTrip(payload) || [
+    'trip_type',
     'weekday',
     'recurrence_type',
     'start_date',
@@ -247,10 +278,23 @@ export async function updateEvent(id, body) {
 
   if (shapeChanged) {
     const today = toIsoDate(new Date());
-    await db.runAsync(`
-      DELETE FROM trip_occurrences
-      WHERE event_id = ? AND user_status = 'pending' AND travel_date >= ?
-    `, id, today);
+    if (isSelectedDateTrip(payload)) {
+      const selectedDates = new Set(payload.selected_dates.map((item) => item.date));
+      const pendingOccurrences = await db.getAllAsync(`
+        SELECT id, travel_date FROM trip_occurrences
+        WHERE event_id = ? AND user_status = 'pending' AND travel_date >= ?
+      `, id, today);
+      for (const occurrence of pendingOccurrences) {
+        if (!selectedDates.has(occurrence.travel_date)) {
+          await db.runAsync('DELETE FROM trip_occurrences WHERE id = ?', occurrence.id);
+        }
+      }
+    } else {
+      await db.runAsync(`
+        DELETE FROM trip_occurrences
+        WHERE event_id = ? AND user_status = 'pending' AND travel_date >= ?
+      `, id, today);
+    }
     await insertOccurrences(id, payload);
   }
 
@@ -333,7 +377,7 @@ export async function getPendingOccurrencesForEvent(eventId, options = {}) {
 export async function getActiveEvents() {
   const db = await getDb();
   const rows = await db.getAllAsync('SELECT * FROM trip_events WHERE is_active = 1 ORDER BY name');
-  return rows.map(mapEvent);
+  return rows.map(mapEvent).filter((event) => !isHolidayTrip(event) && hasCompleteRailDetails(event));
 }
 
 export async function getBookingWindowReminderCandidates() {
@@ -443,6 +487,20 @@ export async function getNotifications(limit = 50) {
 export async function markNotificationRead(id) {
   const db = await getDb();
   await db.runAsync('UPDATE notifications SET is_read = 1 WHERE id = ?', id);
+}
+
+export async function clearCaptchaNotifications(eventId = null) {
+  const db = await getDb();
+  if (eventId) {
+    await db.runAsync(
+      'DELETE FROM notifications WHERE event_id = ? AND message LIKE ?',
+      eventId,
+      'Captcha required%'
+    );
+    return;
+  }
+
+  await db.runAsync('DELETE FROM notifications WHERE message LIKE ?', 'Captcha required%');
 }
 
 export async function clearNotifications() {

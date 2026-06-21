@@ -53,6 +53,11 @@ test('runDueScheduledChecksWithOptions checks every returned occurrence before r
   const event = {
     id: 7,
     name: 'Weekly Chennai',
+    train_no: '12627',
+    class_code: '3A',
+    quota: 'GN',
+    source_station: 'MAS',
+    destination_station: 'SBC',
     check_times: '08:00,13:00',
     threshold: 10
   };
@@ -144,10 +149,105 @@ test('runDueScheduledChecksWithOptions checks every returned occurrence before r
   assert.equal(notificationRows.length, 2);
 });
 
+test('runDueScheduledChecksWithOptions returns remaining due automatic checks when captcha is required', async () => {
+  const cache = new Map();
+  const utils = loadSourceModule('src/utils.js', {}, cache);
+  const today = dayjs().format('YYYY-MM-DD');
+  const events = [
+    {
+      id: 1,
+      name: 'First automatic',
+      train_no: '12627',
+      class_code: '3A',
+      quota: 'GN',
+      source_station: 'MAS',
+      destination_station: 'SBC',
+      check_times: '08:00,13:00',
+      threshold: 10
+    },
+    {
+      id: 2,
+      name: 'Second automatic',
+      train_no: '12628',
+      class_code: 'SL',
+      quota: 'GN',
+      source_station: 'SBC',
+      destination_station: 'MAS',
+      check_times: '08:00',
+      threshold: 10
+    },
+    {
+      id: 3,
+      name: 'Later automatic',
+      train_no: '12629',
+      class_code: 'SL',
+      quota: 'GN',
+      source_station: 'MAS',
+      destination_station: 'SBC',
+      check_times: '20:00',
+      threshold: 10
+    }
+  ];
+  const notifications = [];
+  const requestedRows = [];
+
+  const planner = plannerWithMocks({
+    database: {
+      ensureFutureOccurrences: async () => 1,
+      getActiveEvents: async () => events,
+      getEvent: async (eventId) => events.find((event) => event.id === eventId),
+      getPendingOccurrencesForEvent: async (eventId) => [{
+        id: eventId * 100,
+        event_id: eventId,
+        travel_date: today,
+        user_status: 'pending',
+        threshold: 10,
+        last_alert_signature: null
+      }],
+      hasRun: async () => false
+    },
+    notifications: {
+      createCaptchaNotification: async (...args) => notifications.push(args)
+    },
+    railClient: {
+      requestAvailability: async (row) => {
+        requestedRows.push(row.id);
+        return { captchaRequired: true, detail: 'captcha required' };
+      }
+    },
+    utils: {
+      ...utils,
+      currentLocalTime: () => '13:30'
+    }
+  });
+
+  const result = await planner.runDueScheduledChecksWithOptions({ nativeNotification: false });
+
+  assert.equal(result.captchaRequired, true);
+  assert.equal(result.captchaEventId, 1);
+  assert.deepEqual(result.captchaScheduledTimes, ['08:00', '13:00']);
+  assert.deepEqual(result.captchaResumeEventIds, [2]);
+  assert.deepEqual(result.captchaResumeEventRuns, [{
+    eventId: 2,
+    eventName: 'Second automatic',
+    runDate: dayjs().format('YYYY-MM-DD'),
+    scheduledTimes: ['08:00']
+  }]);
+  assert.deepEqual(requestedRows, [100]);
+  assert.deepEqual(notifications, [[1, 'First automatic', true]]);
+});
+
 test('checkEvent pauses on captcha and succeeds when retried with inputCaptcha', async () => {
   const requested = [];
   const recorded = [];
   const event = { id: 8, name: 'Captcha route', threshold: 5 };
+  Object.assign(event, {
+    train_no: '12627',
+    class_code: '3A',
+    quota: 'GN',
+    source_station: 'MAS',
+    destination_station: 'SBC'
+  });
   const occurrence = {
     id: 201,
     event_id: 8,
@@ -288,7 +388,7 @@ test('checkOccurrence sends new alert signatures and clears stale signatures whe
   ]);
 });
 
-test('runBookingWindowReminders only fires one- and two-day reminder windows', async () => {
+test('runBookingWindowReminders fires two-day, one-day, and 6 AM booking-open reminders', async () => {
   const today = dayjs().startOf('day');
   const candidates = [
     {
@@ -302,6 +402,12 @@ test('runBookingWindowReminders only fires one- and two-day reminder windows', a
       occurrence_id: 12,
       event_name: 'One day',
       travel_date: today.add(61, 'day').format('YYYY-MM-DD')
+    },
+    {
+      event_id: 5,
+      occurrence_id: 15,
+      event_name: 'Today open',
+      travel_date: today.add(60, 'day').format('YYYY-MM-DD')
     },
     {
       event_id: 3,
@@ -318,22 +424,26 @@ test('runBookingWindowReminders only fires one- and two-day reminder windows', a
   ];
   const notifications = [];
   const recorded = [];
+  const alreadyReminded = new Set();
 
   const planner = plannerWithMocks({
     database: {
       ensureFutureOccurrences: async () => 1,
       getBookingWindowReminderCandidates: async () => candidates,
-      hasBookingWindowReminderRun: async (eventId) => eventId === 4,
-      recordBookingWindowReminderRun: async (...args) => recorded.push(args)
+      hasBookingWindowReminderRun: async (eventId) => eventId === 4 || alreadyReminded.has(eventId),
+      recordBookingWindowReminderRun: async (...args) => {
+        recorded.push(args);
+        alreadyReminded.add(args[0]);
+      }
     },
     notifications: {
       createBookingWindowReminderNotification: async (...args) => notifications.push(args)
     }
   });
 
-  const result = await planner.runBookingWindowReminders({ nativeNotification: false });
+  const earlyResult = await planner.runBookingWindowReminders({ nativeNotification: false, localTime: '05:59' });
 
-  assert.equal(result.reminded, 2);
+  assert.equal(earlyResult.reminded, 2);
   assert.deepEqual(
     notifications.map(([eventId, occurrenceId, eventName, daysBefore, native]) => [
       eventId,
@@ -350,5 +460,28 @@ test('runBookingWindowReminders only fires one- and two-day reminder windows', a
   assert.deepEqual(recorded, [
     [1, candidates[0].travel_date, 2],
     [2, candidates[1].travel_date, 1]
+  ]);
+
+  const openResult = await planner.runBookingWindowReminders({ nativeNotification: false, localTime: '06:00' });
+
+  assert.equal(openResult.reminded, 1);
+  assert.deepEqual(
+    notifications.map(([eventId, occurrenceId, eventName, daysBefore, native]) => [
+      eventId,
+      occurrenceId,
+      eventName,
+      daysBefore,
+      native
+    ]),
+    [
+      [1, 11, 'Two day', 2, false],
+      [2, 12, 'One day', 1, false],
+      [5, 15, 'Today open', 0, false]
+    ]
+  );
+  assert.deepEqual(recorded, [
+    [1, candidates[0].travel_date, 2],
+    [2, candidates[1].travel_date, 1],
+    [5, candidates[2].travel_date, 0]
   ]);
 });

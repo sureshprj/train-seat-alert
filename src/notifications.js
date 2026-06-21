@@ -1,6 +1,10 @@
 import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
-import { clearNotifications as clearRows, createNotificationRow } from './database';
+import {
+  clearCaptchaNotifications as clearCaptchaRows,
+  clearNotifications as clearRows,
+  createNotificationRow
+} from './database';
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -80,17 +84,41 @@ export async function createCaptchaNotification(eventId, eventName, native = tru
   return createAvailabilityNotification(
     eventId,
     null,
-    `Captcha required before automatic checks can continue for ${eventName}.`,
+    'Captcha required to continue scheduled seat checks.',
     native,
     { type: 'captcha_required', eventId },
     'Captcha required'
   );
 }
 
+export async function clearDeliveredCaptchaNotifications(eventId = null) {
+  await clearCaptchaRows(eventId);
+
+  try {
+    const delivered = await Notifications.getPresentedNotificationsAsync();
+    const captchaNotifications = delivered.filter((notification) => {
+      const data = notification?.request?.content?.data || {};
+      if (data.type !== 'captcha_required') return false;
+      return !eventId || Number(data.eventId) === Number(eventId);
+    });
+
+    await Promise.all(
+      captchaNotifications.map((notification) => (
+        Notifications.dismissNotificationAsync(notification.request.identifier)
+      ))
+    );
+    if (captchaNotifications.length) await Notifications.setBadgeCountAsync(0);
+  } catch (err) {
+    console.warn('Unable to clear captcha notifications:', err.message);
+  }
+}
+
 export async function createBookingWindowReminderNotification(eventId, occurrenceId, eventName, daysBefore, native = true) {
-  const message = daysBefore === 1
-    ? `Booking opens tomorrow for "${eventName}". Ready to book your ticket.`
-    : `Booking opens in ${daysBefore} days for "${eventName}". Keep passenger details ready.`;
+  const message = daysBefore === 0
+    ? `Booking opens today for "${eventName}". Create a Seat Check Trip or book your ticket.`
+    : daysBefore === 1
+      ? `Booking opens tomorrow for "${eventName}". Ready to book your ticket.`
+      : `Booking opens in ${daysBefore} days for "${eventName}". Keep passenger details ready.`;
 
   return createAvailabilityNotification(
     eventId,

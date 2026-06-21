@@ -4,6 +4,29 @@ import { Ionicons } from '@expo/vector-icons';
 import { updateOccurrenceStatus } from '../database';
 import { ADVANCE_DAYS, formatDateTime, formatDisplayDate } from '../utils';
 
+function localDateFromIso(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || ''));
+  if (!match) return new Date(value);
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+}
+
+function addDays(date, days) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  next.setHours(0, 0, 0, 0);
+  return next;
+}
+
+function daysBetween(start, end) {
+  return Math.round((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000));
+}
+
+function bookingCountdownText(daysUntilOpen) {
+  if (daysUntilOpen <= 0) return 'Booking window open';
+  if (daysUntilOpen === 1) return 'Booking opens tomorrow';
+  return `Booking opens in ${daysUntilOpen} days`;
+}
+
 export default function CalendarScreen({
   styles,
   Screen,
@@ -24,9 +47,91 @@ export default function CalendarScreen({
   calendarAvailabilityText,
   calendarAvailabilityValue,
   formatBookingDate,
-  formatFriendlyBookingDate
+  formatFriendlyBookingDate,
+  hasCompleteRailDetails,
+  occurrenceBookingOpenText,
+  coveredSeatCheckDates = new Set(),
+  openSeatCheckFromHoliday
 }) {
   const windowInfo = selectedEvent ? bookingWindowInfo(selectedEvent) : null;
+  const railReady = selectedEvent ? hasCompleteRailDetails(selectedEvent) : false;
+  const holidayTrip = selectedEvent?.trip_type === 'holiday';
+  const selectedDateTrip = holidayTrip || selectedEvent?.trip_type === 'seat_check';
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  function renderHolidayReminderCard(occurrence) {
+    const travelDate = localDateFromIso(occurrence.travel_date);
+    const bookingOpenDate = addDays(travelDate, -ADVANCE_DAYS);
+    const daysUntilOpen = daysBetween(today, bookingOpenDate);
+    const passed = travelDate < today;
+    const bookingOpen = !passed && bookingOpenDate <= today;
+    const seatCheckCreated = coveredSeatCheckDates.has(occurrence.travel_date);
+    const statusText = passed
+      ? 'Travel date passed'
+      : seatCheckCreated
+        ? 'Seat check created'
+        : bookingCountdownText(daysUntilOpen);
+    const pillTone = passed ? 'neutral' : (bookingOpen || seatCheckCreated ? 'success' : (daysUntilOpen <= 2 ? 'warning' : 'neutral'));
+
+    return (
+      <View key={occurrence.id} style={[
+        styles.card,
+        bookingOpen && !seatCheckCreated && styles.occurrenceCard_available,
+        passed && styles.disabledInfoCard
+      ]}>
+        <View style={styles.cardHeader}>
+          <View style={styles.occurrenceHeaderTitle}>
+            <Text style={styles.cardTitle}>{formatDisplayDate(occurrence.travel_date)}</Text>
+            <Text style={styles.subtle}>{occurrence.travel_date}</Text>
+          </View>
+          <Pill label={statusText} tone={pillTone} />
+        </View>
+
+        {occurrence.source_label ? (
+          <Text style={styles.primaryLine}>{occurrence.source_label}</Text>
+        ) : null}
+        <View style={styles.bookingWindowRow}>
+          <View style={styles.bookingWindowItem}>
+            <Text style={styles.bookingWindowLabel}>Booking opens</Text>
+            <Text style={styles.bookingWindowDate}>{formatBookingDate(bookingOpenDate)}</Text>
+          </View>
+          <View style={styles.bookingWindowItem}>
+            <Text style={styles.bookingWindowLabel}>Travel date</Text>
+            <Text style={styles.bookingWindowDate}>{formatBookingDate(travelDate)}</Text>
+          </View>
+        </View>
+
+        {bookingOpen && !seatCheckCreated && !passed ? (
+          <>
+            <View style={styles.tripWarning}>
+              <Ionicons name="ticket-outline" size={17} color="#8a5300" />
+              <View style={styles.flexOne}>
+                <Text style={styles.tripWarningTitle}>Booking window open</Text>
+                <Text style={styles.tripWarningText}>Create a Seat Check Trip to monitor availability for this date.</Text>
+              </View>
+            </View>
+            <View style={styles.compactActions}>
+              <IconButton
+                icon="add-circle-outline"
+                label="Create seat check"
+                compact
+                onPress={() => openSeatCheckFromHoliday?.(selectedEvent, occurrence)}
+                disabled={busy}
+              />
+            </View>
+          </>
+        ) : null}
+
+        {seatCheckCreated ? (
+          <Text style={styles.metaLine}>Availability monitoring is already set for this travel date.</Text>
+        ) : null}
+        {!bookingOpen && !passed ? (
+          <Text style={styles.metaLine}>We will remind you before railway booking opens.</Text>
+        ) : null}
+      </View>
+    );
+  }
 
   return (
     <Screen>
@@ -34,17 +139,19 @@ export default function CalendarScreen({
         <View style={styles.flexOne}>
           <Text style={styles.screenTitle}>Trip Calendar</Text>
           <Text style={styles.subtle}>
-            {selectedEvent ? `${selectedEvent.name}: ${selectedEvent.occurrences.length} generated dates` : 'Select a trip first'}
+            {selectedEvent
+              ? `${selectedEvent.name}: ${selectedEvent.occurrences.length} ${selectedDateTrip ? 'selected' : 'generated'} dates`
+              : 'Select a trip first'}
           </Text>
         </View>
-        {selectedEvent && (
+        {selectedEvent && !holidayTrip && (
           <TouchableOpacity
-            style={[styles.iconOnlyStrong, busy && styles.buttonDisabled]}
+            style={[styles.iconOnlyStrong, (busy || !railReady) && styles.buttonDisabled]}
             onPress={() => withBusy(() => runEventCheck(selectedEvent), {
               title: 'Checking trip calendar',
               detail: `${selectedEvent.name} occurrences are being checked sequentially.`
             })}
-            disabled={busy}
+            disabled={busy || !railReady}
           >
             <Ionicons name="flash-outline" size={20} color="#fff" />
           </TouchableOpacity>
@@ -56,6 +163,8 @@ export default function CalendarScreen({
       ) : (
         <>
           {selectedEvent.occurrences.map((occurrence) => {
+            if (holidayTrip) return renderHolidayReminderCard(occurrence);
+
             const visualState = occurrenceVisualState(occurrence, selectedEvent);
             const availabilityText = calendarAvailabilityText(occurrence);
             const availabilityValue = calendarAvailabilityValue(occurrence);
@@ -70,7 +179,7 @@ export default function CalendarScreen({
                     <Text style={styles.subtle}>{occurrence.travel_date}</Text>
                   </View>
                   <View style={styles.occurrenceHeaderActions}>
-                    <IrctcLinkButton onPress={() => openRailConnect(selectedEvent, occurrence)} />
+                    {railReady && <IrctcLinkButton onPress={() => openRailConnect(selectedEvent, occurrence)} />}
                     <Pill
                       label={occurrenceVisualLabel(visualState)}
                       tone={visualState}
@@ -90,6 +199,11 @@ export default function CalendarScreen({
                   </Text>
                 </View>
                 <Text style={styles.metaLine}>Last checked: {formatDateTime(occurrence.last_checked_at)}</Text>
+                {occurrence.source_label && <Text style={styles.metaLine}>Holiday: {occurrence.source_label}</Text>}
+                {holidayTrip && <Text style={styles.metaLine}>{occurrenceBookingOpenText(occurrence)}</Text>}
+                {holidayTrip && !railReady && (
+                  <Text style={styles.metaLine}>Create a Seat Check Trip when you want availability alerts.</Text>
+                )}
                 {occurrence.user_status !== 'pending' && (
                   <Text style={styles.metaLine}>User status: {occurrence.user_status}</Text>
                 )}
@@ -102,7 +216,7 @@ export default function CalendarScreen({
                       title: 'Checking one travel date',
                       detail: `${formatDisplayDate(occurrence.travel_date)} availability is being requested.`
                     })}
-                    disabled={busy}
+                    disabled={busy || !railReady}
                   />
                   <IconButton
                     icon="ticket-outline"

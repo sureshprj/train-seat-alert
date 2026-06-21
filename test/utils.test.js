@@ -4,9 +4,13 @@ const dayjs = require('dayjs');
 const { loadSourceModule } = require('./loadSourceModule');
 
 const {
+  ADVANCE_DAYS,
   WEEKDAYS,
+  DEFAULT_CHECK_TIMES,
   generateTravelDates,
+  hasCompleteRailDetails,
   normalizeEventPayload,
+  normalizeSelectedHolidayDates,
   parseAvailability,
   validateEventPayload,
   formatAvailabilitySummary
@@ -84,6 +88,24 @@ test('normalizeEventPayload extracts codes from user-facing labels', () => {
   assert.equal(payload.booking_window_reminders, 1);
 });
 
+test('normalizeEventPayload applies automatic default check times', () => {
+  assert.equal(
+    normalizeEventPayload({
+      name: 'Default checks',
+      weekday: 'Tuesday',
+      train_no: '12627',
+      class_code: 'SL',
+      quota: 'GN',
+      source_station: 'MAS',
+      destination_station: 'SBC',
+      threshold: '5',
+      check_times: '',
+      is_active: true
+    }).check_times,
+    DEFAULT_CHECK_TIMES
+  );
+});
+
 test('validateEventPayload reports invalid form inputs clearly', () => {
   assert.equal(
     validateEventPayload(normalizeEventPayload({
@@ -131,6 +153,126 @@ test('validateEventPayload reports invalid form inputs clearly', () => {
       is_active: true
     })),
     'Invalid check time(s): 25:90. Use HH:mm in 24-hour time.'
+  );
+});
+
+test('holiday trips can save selected dates without train details', () => {
+  const afterBookingWindow = dayjs().add(ADVANCE_DAYS + 10, 'day').format('YYYY-MM-DD');
+  const nextDay = dayjs(afterBookingWindow).add(1, 'day').format('YYYY-MM-DD');
+  const payload = normalizeEventPayload({
+    trip_type: 'holiday',
+    name: 'Diwali trip',
+    selected_dates: [
+      { date: afterBookingWindow, name: 'Diwali' },
+      { travel_date: nextDay, source_label: 'Diwali +1' },
+      { date: 'bad-date', name: 'Ignore me' }
+    ],
+    booking_window_reminders: true,
+    is_active: true
+  });
+
+  assert.equal(payload.trip_type, 'holiday');
+  assert.equal(payload.selected_dates.length, 2);
+  assert.deepEqual(payload.selected_dates.map((item) => item.date), [afterBookingWindow, nextDay]);
+  assert.equal(hasCompleteRailDetails(payload), false);
+  assert.equal(validateEventPayload(payload), '');
+});
+
+test('holiday trips require selected dates but ignore rail fields', () => {
+  const afterBookingWindow = dayjs().add(ADVANCE_DAYS + 10, 'day').format('YYYY-MM-DD');
+
+  assert.equal(
+    validateEventPayload(normalizeEventPayload({
+      trip_type: 'holiday',
+      name: 'Empty holiday',
+      selected_dates: []
+    })),
+    'Choose at least one holiday travel date'
+  );
+
+  const payload = normalizeEventPayload({
+      trip_type: 'holiday',
+      name: 'Partial rail',
+      selected_dates: [afterBookingWindow],
+      train_no: '12627'
+  });
+  assert.equal(validateEventPayload(payload), '');
+});
+
+test('holiday trips require dates after the booking window', () => {
+  const today = dayjs().format('YYYY-MM-DD');
+  const insideWindow = dayjs().add(Math.max(0, Math.floor(ADVANCE_DAYS / 2)), 'day').format('YYYY-MM-DD');
+  const afterBookingWindow = dayjs().add(ADVANCE_DAYS + 1, 'day').format('YYYY-MM-DD');
+
+  assert.equal(
+    validateEventPayload(normalizeEventPayload({
+      trip_type: 'holiday',
+      name: 'Today holiday',
+      selected_dates: [today]
+    })),
+    'Holiday Travel dates must be after the current booking window'
+  );
+
+  assert.equal(
+    validateEventPayload(normalizeEventPayload({
+      trip_type: 'holiday',
+      name: 'Inside window holiday',
+      selected_dates: [insideWindow]
+    })),
+    'Holiday Travel dates must be after the current booking window'
+  );
+
+  assert.equal(
+    validateEventPayload(normalizeEventPayload({
+      trip_type: 'holiday',
+      name: 'Future holiday',
+      selected_dates: [afterBookingWindow]
+    })),
+    ''
+  );
+});
+
+test('seat check trips require selected dates inside the booking window and train details', () => {
+  const today = dayjs().format('YYYY-MM-DD');
+  const outsideWindow = dayjs().add(90, 'day').format('YYYY-MM-DD');
+
+  assert.equal(
+    validateEventPayload(normalizeEventPayload({
+      trip_type: 'seat_check',
+      name: 'Seat check',
+      selected_dates: [today]
+    })),
+    'Please fill: Train, Class, Quota, From station, To station'
+  );
+
+  assert.equal(
+    validateEventPayload(normalizeEventPayload({
+      trip_type: 'seat_check',
+      name: 'Seat check',
+      selected_dates: [outsideWindow],
+      train_no: '12627',
+      class_code: 'SL',
+      quota: 'GN',
+      source_station: 'MAS',
+      destination_station: 'SBC',
+      threshold: '5',
+      is_active: true
+    })),
+    'Seat Check Trip dates must be inside the current booking window'
+  );
+});
+
+test('normalizeSelectedHolidayDates deduplicates by date and keeps useful labels', () => {
+  assert.deepEqual(
+    normalizeSelectedHolidayDates([
+      { date: '2026-01-26', name: 'Republic Day' },
+      { date: '2026-01-26', source_label: 'Custom date' },
+      '2026-01-27'
+    ]),
+    [
+      { date: '2026-01-26', source_label: 'Republic Day' },
+      { date: '2026-01-27', source_label: 'Custom date' }
+    ]
   );
 });
 
